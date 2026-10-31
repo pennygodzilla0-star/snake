@@ -1,3 +1,8 @@
+
+
+
+
+
 const velikost = 20;
 const sirina = 600;
 
@@ -453,14 +458,14 @@ let musicBassStep = 0;
 let musicHatNextMs = 0;
 
 const modes = [
-    "Regular", "Food Effects", "Walls", "Chaos",
+    "Regular", "Food Effects", "Walls",
     "Multiple Food", "Speed Increase", "Portal", "AI Mode",
     "Chaser", "Minefield", "Boss Rush", "Multiplayer",
     "Time Warp", "Homing Food", "Boss Fight", "Echo Shadow",
     "Mirror Snake", "Gravity", "Platformer", "Geometry Dash", "GD Ship", "GD Wave", "GD Swing", "GD Robot", "GD UFO", "GD Ball",
     "GD Spider", "GD Dart", "GD Mini", "Daily Challenge",
-    "Custom Mode", "Ghost Race", "GD Portal Level", "Stereo Madness", "Wave Skill Tester", "Pulse Factory", "Grok Showcase", "Tower Climb", "AI Lab",
-    "Snake+GD Hybrid", "GD AI Demon"
+    "Custom Mode", "Ghost Race", "GD Portal Level", "Stereo Madness", "Wave Skill Tester", "Pulse Factory", "Tower Climb",
+    "Snake+GD Hybrid"
 ];
 
 let selectedMode = 0;
@@ -593,6 +598,8 @@ let gdSwingDir = 1;
 let gdSwingLatch = false;
 let gdSwingInputQueued = false;
 let gdSpiderHeldPrev = false;
+let gdSpiderTrail = null; // { x, y0, y1, life } vertical line during teleport
+let gdSpiderStickY = null; // world Y to stick when onGround (block/slope/floor)
 let gdInputArmReady = false; // wait for release after menu click
 let gdDashing = false;
 let gdDashTimer = 0;
@@ -1425,16 +1432,13 @@ function drawLevelBuilderMenu() {
             // editor row: vr is top-down draw index; oy+ = up in play → move toward smaller py
             const py = gy + vr * ch - oy * ch;
             const cellScale = constrain(Number(cellMeta.scale) || 1, 0.5, 18);
-            const cellRot = ((Number(cellMeta.rot) || 0) % 360 + 360) % 360;
             const isPortalDraw = tname === "portal" || tname === "gravityUp" || tname === "gravityDown"
                 || tname === "portalDual" || tname === "sizeMini" || tname === "sizeNormal" || tname === "endDual";
             push();
             translate(px + cw / 2, py + ch / 2);
-            if (cellRot) rotate(radians(cellRot));
             if (isPortalDraw) scale(1, cellScale);
             else scale(cellScale);
             translate(-(px + cw / 2), -(py + ch / 2));
-            // All drawing below uses px/py — transform already applied
             if (tname === "spike") {
                 triangle(px + 2, py + ch - 2, px + cw / 2, py + 3, px + cw - 2, py + ch - 2);
             } else if (tname === "spikeDown") {
@@ -1515,14 +1519,21 @@ function drawLevelBuilderMenu() {
                 rect(px + 2, py + 3, cw - 4, ch - 6, 2);
                 fill(255); textSize(6); textAlign(CENTER, CENTER);
                 text("N", px + cw / 2, py + ch / 2);
-            } else if (tname === "slope") {
-                // / cut block (left low, right high)
+            } else if (tname === "slope" || tname === "slopeFlip") {
+                // Base triangle + cell rot (90° steps) — cell size stays the same
                 fill(col[0], col[1], col[2]);
-                triangle(px + 1, py + ch - 1, px + cw - 1, py + ch - 1, px + cw - 1, py + 1);
-            } else if (tname === "slopeFlip") {
-                // \ cut block (left high, right low)
-                fill(col[0], col[1], col[2]);
-                triangle(px + 1, py + 1, px + 1, py + ch - 1, px + cw - 1, py + ch - 1);
+                const srot = ((Number(cellMeta.rot) || 0) % 360 + 360) % 360;
+                push();
+                translate(px + cw / 2, py + ch / 2);
+                if (srot) rotate(radians(srot));
+                if (tname === "slope") {
+                    // /  (bl, br, tr)
+                    triangle(-cw / 2 + 1, ch / 2 - 1, cw / 2 - 1, ch / 2 - 1, cw / 2 - 1, -ch / 2 + 1);
+                } else {
+                    // \ (tl, bl, br)
+                    triangle(-cw / 2 + 1, -ch / 2 + 1, -cw / 2 + 1, ch / 2 - 1, cw / 2 - 1, ch / 2 - 1);
+                }
+                pop();
             } else if (tname === "sawblade") {
                 fill(220, 50, 50);
                 ellipse(px + cw / 2, py + ch / 2, cw * 0.85, ch * 0.85);
@@ -1544,14 +1555,13 @@ function drawLevelBuilderMenu() {
                 fill(255); textSize(7); textAlign(CENTER, CENTER);
                 text(tgt, px + cw / 2, py + ch / 2);
             }
-            // rotation badge (outside rotated transform so text stays readable)
             pop();
-            if (cellRot) {
-                fill(255, 220, 80); textSize(7); textAlign(CENTER, CENTER); noStroke();
-                text(cellRot + "°", px + cw / 2, py + 6);
+            // Rot badge only — does not rotate the cell graphic
+            const showRot = ((Number(cellMeta.rot) || 0) % 360 + 360) % 360;
+            if (showRot) {
+                fill(255, 220, 80); textSize(6); textAlign(CENTER, CENTER); noStroke();
+                text(showRot + "°", px + cw / 2, py + 5);
             }
-            // re-open if needed — already popped
-            if (false) pop();
         }
     }
     // ground line
@@ -1623,7 +1633,7 @@ function drawLevelBuilderMenu() {
     const ox = Number(selectedMeta.ox) || 0, oy = Number(selectedMeta.oy) || 0;
     const srot = Number(selectedMeta.rot) || 0;
     fill(200); textSize(7); textAlign(LEFT, CENTER);
-    text((ox.toFixed(1)+","+oy.toFixed(1)) + " r" + srot + "°", 512, btnY + 10);
+    text((ox.toFixed(1)+","+oy.toFixed(1)) + (srot ? (" r"+srot+"°") : ""), 512, btnY + 10);
 
     // Saved levels (thin bar)
     const sY = btnY + 24;
@@ -1899,7 +1909,8 @@ function builderPasteSelection() {
 }
 
 function builderRotateSelected() {
-    // ALWAYS exactly +90° on meta.rot
+    // +90° on meta.rot — cells stay the same shape; badge shows angle.
+    // At 180° spike/slope/pad/gravity also type-swap so editor icon matches play.
     let keys = typeof builderGetSelectionKeys === "function" ? builderGetSelectionKeys() : [];
     if (!keys.length && levelBuilder.selectedCell) keys = [levelBuilder.selectedCell];
     if (!keys.length) {
@@ -1908,22 +1919,61 @@ function builderRotateSelected() {
     }
     builderPushUndo();
     if (!levelBuilder.cellMeta) levelBuilder.cellMeta = {};
-    let n = 0;
-    let lastRot = 0;
+    const tools = builderCurrentTools();
+    let n = 0, lastRot = 0;
     for (let key of keys) {
         const p = key.split(",").map(Number);
         const r = p[0], c = p[1];
         const v = levelBuilder.grid[r] && levelBuilder.grid[r][c];
         if (!v) continue;
+        const tname = tools[v - 1] || "";
         const meta = levelBuilder.cellMeta[key] || {};
         const prev = Number(meta.rot) || 0;
         const rot = (prev + 90) % 360;
-        levelBuilder.cellMeta[key] = { ...meta, rot: rot };
         lastRot = rot;
+
+        // SLOPE: true +90° rotation (meta.rot) — icon + play use same angle
+        if (tname === "slope" || tname === "slopeFlip") {
+            levelBuilder.cellMeta[key] = { ...meta, rot: rot };
+            n++;
+            continue;
+        }
+
+        // waveSlope: cycle mode each press
+        if (tname === "waveSlope") {
+            let sm = meta.slopeMode != null ? meta.slopeMode : 1;
+            if (sm === 1) sm = -1;
+            else if (sm === -1) sm = 0;
+            else sm = 1;
+            levelBuilder.cellMeta[key] = { ...meta, slopeMode: sm };
+            n++;
+            continue;
+        }
+
+        // spike / pads / gravity: type-swap every press (clear visual)
+        const swapsEvery = {
+            spike: "spikeDown", spikeDown: "spike",
+            padYellow: "padYellowCeil", padYellowCeil: "padYellow",
+            padBlue: "padBlueCeil", padBlueCeil: "padBlue",
+            padPink: "padPinkCeil", padPinkCeil: "padPink",
+            gravityUp: "gravityDown", gravityDown: "gravityUp"
+        };
+        if (swapsEvery[tname]) {
+            const ni = tools.indexOf(swapsEvery[tname]);
+            if (ni >= 0) levelBuilder.grid[r][c] = ni + 1;
+            const m = { ...meta };
+            delete m.rot;
+            levelBuilder.cellMeta[key] = m;
+            n++;
+            continue;
+        }
+
+        // everything else: store +90° rot
+        levelBuilder.cellMeta[key] = { ...meta, rot: rot };
         n++;
     }
     if (n === 0) levelBuilder.msg = "No object on selected cell";
-    else levelBuilder.msg = "ROT +90° → " + lastRot + "° (" + n + " obj)";
+    else levelBuilder.msg = "ROT +90° → " + lastRot + "° (" + n + ")";
 }
 
 function builderNudgeSelected(dx, dy) {
@@ -2272,10 +2322,8 @@ function startBuilderTest() {
             const firstObstacleIndex = gdObstacles.length;
 
             if (tname === "spike") {
-                // Anywhere: sits on bottom of chosen cell, tip points up
                 gdObstacles.push({ type: "spike", x: x + (LB_CELL_W - 20) / 2, y: yTop + blockH - 20, w: 20, h: 20 });
             } else if (tname === "spikeDown") {
-                // Anywhere: hangs from top of cell, tip points down
                 gdObstacles.push({ type: "spikeDown", x: x + (LB_CELL_W - 20) / 2, y: yTop, w: 20, h: 20 });
             } else if (tname === "block") {
                 gdObstacles.push({ type: "block", x: x, y: yTop, w: LB_CELL_W - 4, h: blockH });
@@ -2396,10 +2444,9 @@ function startBuilderTest() {
                     w: LB_CELL_W - 12, h: Math.max(18, blockH - 4), used: false
                 });
             } else if (tname === "slope") {
-                // Solid / slope (walkable top edge for cube etc.)
-                gdObstacles.push({ type: "slope", x: x, y: yTop, w: LB_CELL_W - 4, h: blockH, dir: 1 });
+                gdObstacles.push({ type: "slope", x: x, y: yTop, w: LB_CELL_W - 4, h: blockH, dir: 1, rot: Number(meta.rot) || 0 });
             } else if (tname === "slopeFlip") {
-                gdObstacles.push({ type: "slope", x: x, y: yTop, w: LB_CELL_W - 4, h: blockH, dir: -1 });
+                gdObstacles.push({ type: "slope", x: x, y: yTop, w: LB_CELL_W - 4, h: blockH, dir: -1, rot: Number(meta.rot) || 0 });
             } else if (tname === "sawblade") {
                 // SIZE: 0.5 small, 1 medium, 2 large, 3 huge
                 const sc = constrain(Number(meta.scale) || 1, 0.5, 3);
@@ -2433,48 +2480,30 @@ function startBuilderTest() {
                     activated: false
                 });
             }
-            // stamp rot + apply geometry so collision matches visual
+            // stamp rot — visual + hitbox use o.rot; only AABB boxes swap w/h
             if (meta.rot) {
                 const rot = ((Number(meta.rot) % 360) + 360) % 360;
                 for (let oi = firstObstacleIndex; oi < gdObstacles.length; oi++) {
                     const ob = gdObstacles[oi];
                     ob.rot = rot;
-                    // Solid slopes: rotation changes which diagonal is walkable
-                    if (ob.type === "slope") {
-                        // 90° / 270°: swap / ↔ \
-                        if (rot === 90 || rot === 270) {
-                            ob.dir = -(ob.dir || 1);
-                        }
-                        // 180°: invert dir and flip cell vertically (surface mirrors)
-                        if (rot === 180) {
-                            ob.dir = -(ob.dir || 1);
-                        }
-                        // 90/270 also swap footprint so AABB matches rotated triangle
-                        if (rot === 90 || rot === 270) {
-                            const cx = ob.x + ob.w / 2, cy = ob.y + ob.h / 2;
-                            const nw = ob.h, nh = ob.w;
-                            ob.w = nw; ob.h = nh;
-                            ob.x = cx - nw / 2;
-                            ob.y = cy - nh / 2;
-                        }
-                        continue;
-                    }
-                    // waveSlope: invert slopeMode on 180, swap on 90/270
+                    // Spikes: pure rotation (full-cell), no type/w-h swap
+                    if (ob.type === "spike" || ob.type === "spikeDown") continue;
+                    // Slopes: store rot; draw/collide from rotated verts (dir stays as authored)
+                    if (ob.type === "slope") continue;
+                    // waveSlope: 90/180/270 invert slope direction
                     if (ob.type === "waveSlope") {
-                        let sm = ob.slopeMode != null ? ob.slopeMode : 1;
-                        if (rot === 180) sm = -sm;
-                        else if (rot === 90 || rot === 270) sm = -sm;
-                        ob.slopeMode = sm;
+                        const sm0 = ob.slopeMode != null ? ob.slopeMode : 1;
+                        if (rot === 90 || rot === 180 || rot === 270) ob.slopeMode = -sm0;
                         continue;
                     }
                     // gravity portals: 180 flips up↔down
-                    if (ob.type === "gravityPortal" && rot === 180) {
-                        ob.gravityDir = -(ob.gravityDir || 1);
+                    if (ob.type === "gravityPortal") {
+                        if (rot === 180) ob.gravityDir = -(ob.gravityDir || 1);
                         continue;
                     }
-                    // spikes/blocks/pads/etc: swap w/h for 90/270 around center
+                    // Axis-aligned solids (blocks/walls): swap footprint for 90/270
                     if ((rot === 90 || rot === 270) && ob.w != null && ob.h != null
-                        && ob.type !== "goal" && ob.type !== "sawblade") {
+                        && (ob.type === "block" || ob.type === "wall" || ob.type === "plat")) {
                         const cx = ob.x + ob.w / 2, cy = ob.y + ob.h / 2;
                         const nw = ob.h, nh = ob.w;
                         ob.w = nw; ob.h = nh;
@@ -2570,10 +2599,42 @@ function startBuilderTest() {
             () => true,
             (p, x, top, w, h) => ({ type: "block", x, y: top, w, h })
         );
-        mergeVertical("slope",
-            (a, b) => a.dir === b.dir,
-            (p, x, top, w, h) => ({ type: "slope", x, y: top, w, h, dir: p.dir })
-        );
+        // Solid slopes: merge HORIZONTALLY (same row, same dir) into one continuous ramp.
+        // Vertical merge was wrong — stacked cells became a tall triangle with no walkable surface.
+        {
+            let slopes = gdObstacles.filter(o => o.type === "slope");
+            if (slopes.length) {
+                gdObstacles = gdObstacles.filter(o => o.type !== "slope");
+                slopes.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+                const used = new Set();
+                for (let i = 0; i < slopes.length; i++) {
+                    if (used.has(i)) continue;
+                    let o = slopes[i];
+                    used.add(i);
+                    let x0 = o.x, x1 = o.x + o.w, y = o.y, h = o.h, dir = o.dir || 1;
+                    const rot0 = Number(o.rot) || 0;
+                    let changed = true;
+                    while (changed) {
+                        changed = false;
+                        for (let j = 0; j < slopes.length; j++) {
+                            if (used.has(j)) continue;
+                            const q = slopes[j];
+                            if ((q.dir || 1) !== dir) continue;
+                            if ((Number(q.rot) || 0) !== rot0) continue; // don't merge different rotations
+                            if (Math.abs(q.y - y) > 6 || Math.abs(q.h - h) > 6) continue;
+                            if (Math.abs(q.x - x1) <= 10) {
+                                x1 = Math.max(x1, q.x + q.w);
+                                used.add(j); changed = true;
+                            } else if (Math.abs((q.x + q.w) - x0) <= 10) {
+                                x0 = Math.min(x0, q.x);
+                                used.add(j); changed = true;
+                            }
+                        }
+                    }
+                    gdObstacles.push({ type: "slope", x: x0, y: y, w: x1 - x0, h: h, dir: dir, rot: rot0 });
+                }
+            }
+        }
     }
     // Merge horizontally adjacent wave slopes (same slopeMode) into longer segments,
     // then stitch continuous corridors.
@@ -2594,9 +2655,9 @@ function startBuilderTest() {
                 const q = slopes[j];
                 const qsm = q.slopeMode != null ? q.slopeMode : 1;
                 if (qsm !== sm) continue;
-                if (Math.abs(q.x - x1) > 6) continue;
-                // same vertical band
-                if (Math.abs((q._center || 0) - (c0 || 0)) > half * 0.8 && c0 != null && q._center != null) continue;
+                if (Math.abs(q.x - x1) > 8) continue;
+                // allow slight vertical difference so stacked corridor pieces still link
+                if (c0 != null && q._center != null && Math.abs((q._center || 0) - (c0 || 0)) > half * 1.25) continue;
                 x1 = Math.max(x1, q.x + q.w);
                 used.add(j);
             }
@@ -4664,6 +4725,8 @@ function initGeometryDash() {
     gdSwingLatch = false;
     gdSwingInputQueued = false;
     gdSpiderHeldPrev = false;
+    gdSpiderTrail = null;
+    gdSpiderStickY = null;
     gdInputArmReady = false;
     gdDashing = false;
     gdDashTimer = 0;
@@ -7072,20 +7135,19 @@ function updateGeometryDash() {
                 }
             }
         }
-        // solid slopes (cut blocks)
+        // solid slopes (cut blocks) — continuous ramps support cube
         for (let o of gdObstacles) {
             if (o.type !== "slope") continue;
             let sx = o.x - gdScroll;
-            if (gdCube.x + gdCube.w <= sx + 2 || gdCube.x >= sx + o.w - 2) continue;
-            const t = constrain((gdCube.x + gdCube.w * 0.5 - sx) / o.w, 0, 1);
-            const surfaceY = o.dir > 0 ? (o.y + o.h) - t * o.h : o.y + t * o.h;
-            if (gDir > 0 && gdCube.vy >= 0 &&
-                gdCube.y + gdCube.h >= surfaceY - 2 && gdCube.y + gdCube.h <= surfaceY + 16) {
+            if (gdCube.x + gdCube.w <= sx + 1 || gdCube.x >= sx + o.w - 1) continue;
+            const surfaceY = gdSlopeSurfaceY(o, sx, gdCube.x + gdCube.w * 0.5);
+            if (gDir > 0 && gdCube.vy >= -0.5 &&
+                gdCube.y + gdCube.h >= surfaceY - 4 && gdCube.y + gdCube.h <= surfaceY + 22) {
                 gdCube.y = surfaceY - gdCube.h;
                 gdCube.vy = 0;
                 gdCube.onGround = true;
-            } else if (gDir < 0 && gdCube.vy <= 0 &&
-                gdCube.y <= surfaceY + 2 && gdCube.y >= surfaceY - 16) {
+            } else if (gDir < 0 && gdCube.vy <= 0.5 &&
+                gdCube.y <= surfaceY + 4 && gdCube.y >= surfaceY - 22) {
                 gdCube.y = surfaceY;
                 gdCube.vy = 0;
                 gdCube.onGround = true;
@@ -7210,11 +7272,10 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             if (o.type !== "slope") continue;
             let sx = o.x - gdScroll;
-            if (gdCube.x + gdCube.w <= sx + 2 || gdCube.x >= sx + o.w - 2) continue;
-            const t = constrain((gdCube.x + gdCube.w * 0.5 - sx) / o.w, 0, 1);
-            const surfaceY = o.dir > 0 ? (o.y + o.h) - t * o.h : o.y + t * o.h;
-            if (gDir > 0 && gdCube.vy >= 0 &&
-                gdCube.y + gdCube.h >= surfaceY - 2 && gdCube.y + gdCube.h <= surfaceY + 18) {
+            if (gdCube.x + gdCube.w <= sx + 1 || gdCube.x >= sx + o.w - 1) continue;
+            const surfaceY = gdSlopeSurfaceY(o, sx, gdCube.x + gdCube.w * 0.5);
+            if (gDir > 0 && gdCube.vy >= -0.5 &&
+                gdCube.y + gdCube.h >= surfaceY - 4 && gdCube.y + gdCube.h <= surfaceY + 24) {
                 gdCube.y = surfaceY - gdCube.h;
                 gdCube.vy = 0;
                 gdCube.onGround = true;
@@ -7321,10 +7382,28 @@ function updateGeometryDash() {
         }
         gdCube.onGround = stuck;
 
+        // Ball can rest on solid slopes
+        if (!gameOver) {
+            for (let o of gdObstacles) {
+                if (o.type !== "slope") continue;
+                const sx = o.x - gdScroll;
+                if (gdCube.x + gdCube.w <= sx + 1 || gdCube.x >= sx + o.w - 1) continue;
+                const surfaceY = gdSlopeSurfaceY(o, sx, gdCube.x + gdCube.w * 0.5);
+                if (gdBallGravity > 0 && gdCube.vy >= -0.5 &&
+                    gdCube.y + gdCube.h >= surfaceY - 4 && gdCube.y + gdCube.h <= surfaceY + 24) {
+                    gdCube.y = surfaceY - gdCube.h; gdCube.vy = 0; gdCube.onGround = true; stuck = true;
+                } else if (gdBallGravity < 0 && gdCube.vy <= 0.5 &&
+                    gdCube.y <= surfaceY + 4 && gdCube.y >= surfaceY - 24) {
+                    gdCube.y = surfaceY; gdCube.vy = 0; gdCube.onGround = true; stuck = true;
+                }
+            }
+        }
+
         if (!gameOver) {
             for (let o of gdObstacles) {
                 const sx = o.x - gdScroll;
                 if (o.type === "goal" || o.type === "secretCoin") continue; // handled globally
+                if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
                 if (o.type === "spike" || o.type === "spikeDown") {
                     if (gdSpikeHit(gdCube, o, sx)) { gdDie(); break; }
                 } else if (o.type === "hazard") {
@@ -7415,7 +7494,7 @@ function updateGeometryDash() {
                 continue;
             }
             if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
-            if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
+
             if (o.type === "spike" || o.type === "spikeDown") {
                 if (gdSpikeHit(gdCube, o, sx)) { gdDie(); break; }
             } else if (o.type === "hazard") {
@@ -7448,7 +7527,7 @@ function updateGeometryDash() {
                 continue;
             }
             if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
-            if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
+
             if (o.type === "spike" || o.type === "spikeDown") {
                 if (gdSpikeHit(gdCube, o, sx)) { gdDie(); break; }
             } else if (o.type === "hazard") {
@@ -7463,30 +7542,45 @@ function updateGeometryDash() {
         }
 
     } else if (gdVehicle === "spider") {
-        // Spider: edge-triggered surface flip (keyboard OR mouse), unlimited times
-        // Wait for all input released after menu click so first press is intentional
+        // Spider: edge-triggered surface flip onto block / slope / floor / ceil
         const heldNow = gdHold();
         if (!gdInputArmReady) {
             if (!heldNow) gdInputArmReady = true;
         } else if (heldNow && !gdSpiderHeldPrev && gdCube.onGround) {
-            // rising edge while grounded → teleport to other surface (classic spider)
-            gdGravityDir *= -1;
-            gdSwingDir = gdGravityDir;
-            gdBallGravity = gdGravityDir;
-            if (gdGravityDir > 0) gdCube.y = gdGroundY - gdCube.h;
-            else gdCube.y = gdCeilY;
-            gdCube.vy = 0;
-            gdCube.onGround = true;
-            gdStarted = true;
-            playJumpSound();
-            spawnParticles(gdCube.x + gdCube.w / 2, gdCube.y + gdCube.h / 2, 8, color(180, 80, 255));
+            const gDir = gdGravityDir || 1;
+            const flipDir = -gDir; // teleport toward opposite gravity
+            const fromY = gdCube.y;
+            const destY = gdSpiderFindDestY(flipDir);
+            if (destY != null) {
+                const y0 = fromY, y1 = destY;
+                if (gdSpiderPathBlocked(Math.min(y0, y1), Math.max(y0, y1) + gdCube.h)) {
+                    deathCause = "Spider path hazard";
+                    gdDie();
+                } else {
+                    gdGravityDir = -gDir;
+                    gdSwingDir = gdGravityDir;
+                    gdBallGravity = gdGravityDir;
+                    gdCube.y = destY;
+                    gdCube.vy = 0;
+                    gdCube.onGround = true;
+                    gdSpiderStickY = destY;
+                    gdStarted = true;
+                    playJumpSound();
+                    spawnParticles(gdCube.x + gdCube.w / 2, (y0 + y1) * 0.5, 10, color(180, 80, 255));
+                    // World-fixed line — scrolls with level, does not stick to player
+                    gdSpiderTrail = {
+                        worldX: gdScroll + gdCube.x + gdCube.w * 0.5,
+                        y0: Math.min(y0, y1),
+                        y1: Math.max(y0 + gdCube.h, y1 + gdCube.h),
+                        life: 22
+                    };
+                }
+            }
         }
         gdSpiderHeldPrev = heldNow;
         gdSwingInputQueued = false;
         gdSwingLatch = false;
 
-        // Pads & orbs same rules as other vehicles:
-        // yellow = jump (boost off surface), blue = slow gravity flip (gentle kick)
         gdApplyPadOrbs({
             input: gdInputArmReady && heldNow,
             boostYellow: 12.0, boostBlue: 5.5, orbYellow: 11.0, orbBlue: 6.0
@@ -7495,16 +7589,19 @@ function updateGeometryDash() {
         gdBallGravity = gdGravityDir || 1;
 
         const gDir = gdGravityDir || 1;
-        // Only glue when grounded. After yellow jump / blue kick stay airborne and fall.
+        // Glue only while still on a surface; fall off block/slope edges
         if (gdCube.onGround) {
-            if (gDir > 0) {
-                gdCube.y = gdGroundY - gdCube.h;
+            const still = gdSpiderStillSupported(gDir);
+            if (still.ok) {
+                gdCube.y = still.y;
+                gdSpiderStickY = still.y;
                 gdCube.vy = 0;
             } else {
-                gdCube.y = gdCeilY;
-                gdCube.vy = 0;
+                gdCube.onGround = false;
+                gdSpiderStickY = null;
             }
         } else {
+            gdSpiderStickY = null;
             // Airborne: soft gravity toward current gravity direction
             gdCube.vy += 0.55 * gDir;
             gdCube.vy = constrain(gdCube.vy, -14, 14);
@@ -7514,14 +7611,46 @@ function updateGeometryDash() {
                 gdCube.y = gdGroundY - gdCube.h;
                 gdCube.vy = 0;
                 gdCube.onGround = true;
+                gdSpiderStickY = gdCube.y;
             } else if (gDir < 0 && gdCube.y <= gdCeilY) {
                 gdCube.y = gdCeilY;
                 gdCube.vy = 0;
                 gdCube.onGround = true;
+                gdSpiderStickY = gdCube.y;
             }
             // Soft clamp so we don't leave the playfield
             if (gdCube.y < gdCeilY) { gdCube.y = gdCeilY; if (gdCube.vy < 0) gdCube.vy = 0; }
             if (gdCube.y + gdCube.h > gdGroundY) { gdCube.y = gdGroundY - gdCube.h; if (gdCube.vy > 0) gdCube.vy = 0; }
+            // Land on blocks / slopes while airborne
+            for (let o of gdObstacles) {
+                if (o.type === "block" || o.type === "plat" || o.type === "wall") {
+                    const sx = o.x - gdScroll;
+                    if (gdCube.x + gdCube.w <= sx + 2 || gdCube.x >= sx + o.w - 2) continue;
+                    if (gDir > 0 && gdCube.vy >= 0 &&
+                        gdCube.y + gdCube.h >= o.y && gdCube.y + gdCube.h <= o.y + 16 && gdCube.y < o.y) {
+                        gdCube.y = o.y - gdCube.h; gdCube.vy = 0; gdCube.onGround = true; gdSpiderStickY = gdCube.y;
+                    } else if (gDir < 0 && gdCube.vy <= 0 &&
+                        gdCube.y <= o.y + o.h && gdCube.y >= o.y + o.h - 16 && gdCube.y + gdCube.h > o.y + o.h) {
+                        gdCube.y = o.y + o.h; gdCube.vy = 0; gdCube.onGround = true; gdSpiderStickY = gdCube.y;
+                    }
+                } else if (o.type === "slope") {
+                    const sx = o.x - gdScroll;
+                    if (gdCube.x + gdCube.w <= sx + 1 || gdCube.x >= sx + o.w - 1) continue;
+                    const surfaceY = gdSlopeSurfaceY(o, sx, gdCube.x + gdCube.w * 0.5);
+                    if (gDir > 0 && gdCube.vy >= -0.5 &&
+                        gdCube.y + gdCube.h >= surfaceY - 4 && gdCube.y + gdCube.h <= surfaceY + 24) {
+                        gdCube.y = surfaceY - gdCube.h; gdCube.vy = 0; gdCube.onGround = true; gdSpiderStickY = gdCube.y;
+                    } else if (gDir < 0 && gdCube.vy <= 0.5 &&
+                        gdCube.y <= surfaceY + 4 && gdCube.y >= surfaceY - 24) {
+                        gdCube.y = surfaceY; gdCube.vy = 0; gdCube.onGround = true; gdSpiderStickY = gdCube.y;
+                    }
+                }
+            }
+        }
+        // Trail fade
+        if (gdSpiderTrail) {
+            gdSpiderTrail.life--;
+            if (gdSpiderTrail.life <= 0) gdSpiderTrail = null;
         }
         gdCube.rot = (gDir > 0) ? 0 : PI;
 
@@ -7539,6 +7668,7 @@ function updateGeometryDash() {
                     }
                     continue;
                 }
+                if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { deathCause = "Hit saw"; gdDie(); break; }
                 if (o.type === "spike" || o.type === "spikeDown") {
                     if (gdSpikeHit(gdCube, o, sx)) { deathCause = "Hit spike"; gdDie(); break; }
                 } else if (o.type === "hazard") {
@@ -7547,6 +7677,10 @@ function updateGeometryDash() {
                     }
                 } else if (o.type === "wall" || o.type === "block") {
                     if (rectsOverlap(gdCube.x + 2, gdCube.y + 2, gdCube.w - 4, gdCube.h - 4, sx + 2, o.y + 2, o.w - 4, o.h - 4)) {
+                        // on surface → ok; side → lethal (classic) / push (platformer)
+                        const onTop = gDir > 0 && abs((gdCube.y + gdCube.h) - o.y) <= 6;
+                        const onBot = gDir < 0 && abs(gdCube.y - (o.y + o.h)) <= 6;
+                        if (onTop || onBot) continue;
                         if (gdBlockSideLethal(gdCube, o, sx)) { deathCause = "Hit wall"; gdDie(); break; }
                     }
                 }
@@ -7685,14 +7819,13 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             if (o.type !== "slope") continue;
             let sx = o.x - gdScroll;
-            if (gdCube.x + gdCube.w <= sx + 2 || gdCube.x >= sx + o.w - 2) continue;
-            const t = constrain((gdCube.x + gdCube.w * 0.5 - sx) / o.w, 0, 1);
-            const surfaceY = o.dir > 0 ? (o.y + o.h) - t * o.h : o.y + t * o.h;
-            if (gDir > 0 && gdCube.vy >= 0 &&
-                gdCube.y + gdCube.h >= surfaceY - 2 && gdCube.y + gdCube.h <= surfaceY + 18) {
+            if (gdCube.x + gdCube.w <= sx + 1 || gdCube.x >= sx + o.w - 1) continue;
+            const surfaceY = gdSlopeSurfaceY(o, sx, gdCube.x + gdCube.w * 0.5);
+            if (gDir > 0 && gdCube.vy >= -0.5 &&
+                gdCube.y + gdCube.h >= surfaceY - 4 && gdCube.y + gdCube.h <= surfaceY + 24) {
                 gdCube.y = surfaceY - gdCube.h; gdCube.vy = 0; gdCube.onGround = true;
-            } else if (gDir < 0 && gdCube.vy <= 0 &&
-                gdCube.y <= surfaceY + 2 && gdCube.y >= surfaceY - 18) {
+            } else if (gDir < 0 && gdCube.vy <= 0.5 &&
+                gdCube.y <= surfaceY + 4 && gdCube.y >= surfaceY - 24) {
                 gdCube.y = surfaceY; gdCube.vy = 0; gdCube.onGround = true;
             }
         }
@@ -8033,10 +8166,7 @@ if (!gameOver) gdApplyPadOrbs({ input: gdHold(), boostYellow: 9.0, boostBlue: 7.
                     continue;
                 }
                 if (gdCube2.x + gdCube2.w < sx || gdCube2.x > sx + o.w) continue;
-                const t = constrain((gdCube2.x + gdCube2.w * 0.5 - sx) / o.w, 0, 1);
-                const surfaceY = o.dir > 0
-                    ? (o.y + o.h) - t * o.h
-                    : o.y + t * o.h;
+                const surfaceY = gdSlopeSurfaceY(o, sx, gdCube2.x + gdCube2.w * 0.5);
                 if (g2 > 0 && gdCube2.y + gdCube2.h >= surfaceY - 4 && gdCube2.y + gdCube2.h <= surfaceY + 12 && gdCube2.vy >= 0) {
                     gdCube2.y = surfaceY - gdCube2.h;
                     gdCube2.vy = 0;
@@ -8091,7 +8221,7 @@ function recordGDReplayFrame() {
     for (let o of gdObstacles) {
         const sx = o.x - gdScroll;
         const ow = o.w || 0;
-        if (sx < -80 || sx > sirina + 80) continue;
+        if (sx + ow < -40 || sx > sirina + 40) continue;
         const copy = { type: o.type, x: sx, y: o.y, w: ow, h: o.h || 0 };
         if (o.type === "waveSlope") {
             copy.top1 = o.top1; copy.top2 = o.top2;
@@ -8148,27 +8278,124 @@ function gdPointInTri(px, py, x1, y1, x2, y2, x3, y3) {
     return !(neg && pos);
 }
 // Spike: triangular hitbox (floor = tip up, ceiling = tip down)
+// Spider teleport: find opposite surface (floor/ceil/block/slope) along vertical line
+// flipDir > 0 → search downward for stand-on tops; flipDir < 0 → search upward for hang-on bottoms
+// Is spider still standing/hanging on something at current X?
+function gdSpiderStillSupported(gDir) {
+    if (!gdCube) return { ok: false };
+    const left = gdCube.x + 3, right = gdCube.x + gdCube.w - 3;
+    const cx = (left + right) * 0.5;
+    const h = gdCube.h;
+    // Floor / ceiling always count
+    if (gDir > 0) {
+        if (Math.abs((gdCube.y + h) - gdGroundY) <= 6) return { ok: true, y: gdGroundY - h };
+    } else {
+        if (Math.abs(gdCube.y - gdCeilY) <= 6) return { ok: true, y: gdCeilY };
+    }
+    for (let o of gdObstacles) {
+        const sx = o.x - gdScroll;
+        if (right <= sx + 1 || left >= sx + (o.w || 0) - 1) continue;
+        if (o.type === "block" || o.type === "plat" || o.type === "wall") {
+            if (gDir > 0) {
+                const ty = o.y - h;
+                if (Math.abs(gdCube.y - ty) <= 8 || Math.abs((gdCube.y + h) - o.y) <= 8)
+                    return { ok: true, y: ty };
+            } else {
+                const ty = o.y + o.h;
+                if (Math.abs(gdCube.y - ty) <= 8) return { ok: true, y: ty };
+            }
+        } else if (o.type === "slope") {
+            const surfaceY = gdSlopeSurfaceY(o, sx, cx);
+            if (gDir > 0) {
+                const ty = surfaceY - h;
+                if (Math.abs(gdCube.y - ty) <= 10 || Math.abs((gdCube.y + h) - surfaceY) <= 10)
+                    return { ok: true, y: ty };
+            } else {
+                if (Math.abs(gdCube.y - surfaceY) <= 10) return { ok: true, y: surfaceY };
+            }
+        }
+    }
+    return { ok: false };
+}
+function gdSpiderFindDestY(flipDir) {
+    if (!gdCube) return null;
+    const left = gdCube.x + 2, right = gdCube.x + gdCube.w - 2;
+    const cx = (left + right) * 0.5;
+    const h = gdCube.h;
+    const curTop = gdCube.y, curBot = gdCube.y + h;
+    let best = null;
+    const consider = (cubeY) => {
+        if (cubeY == null || isNaN(cubeY)) return;
+        cubeY = constrain(cubeY, gdCeilY, gdGroundY - h);
+        if (flipDir < 0) {
+            // going up: dest must be above current (smaller y), take closest (largest among those above)
+            if (cubeY >= curTop - 1) return;
+            if (best == null || cubeY > best) best = cubeY;
+        } else {
+            // going down: dest below current, closest (smallest among those below)
+            if (cubeY <= curBot - h + 1) return;
+            if (best == null || cubeY < best) best = cubeY;
+        }
+    };
+    if (flipDir < 0) {
+        consider(gdCeilY); // hang from ceiling
+    } else {
+        consider(gdGroundY - h);
+    }
+    for (let o of gdObstacles) {
+        const sx = o.x - gdScroll;
+        if (right <= sx + 1 || left >= sx + (o.w || 0) - 1) continue;
+        if (o.type === "block" || o.type === "plat" || o.type === "wall") {
+            if (flipDir < 0) consider(o.y + o.h); // underside
+            else consider(o.y - h); // top
+        } else if (o.type === "slope") {
+            const surfaceY = gdSlopeSurfaceY(o, sx, cx);
+            if (flipDir < 0) consider(surfaceY); // hang roughly at surface when inverted
+            else consider(surfaceY - h);
+        }
+    }
+    return best;
+}
+// True if a spike/saw intersects the vertical teleport segment
+function gdSpiderPathBlocked(y0, y1) {
+    if (!gdCube) return false;
+    const top = Math.min(y0, y1), bot = Math.max(y0, y1);
+    const left = gdCube.x + 3, right = gdCube.x + gdCube.w - 3;
+    const probe = { x: gdCube.x, y: 0, w: gdCube.w, h: gdCube.h };
+    for (let o of gdObstacles) {
+        const sx = o.x - gdScroll;
+        if (o.type === "spike" || o.type === "spikeDown") {
+            // sample along path
+            for (let t = 0; t <= 1.001; t += 0.12) {
+                probe.y = top + (bot - top - gdCube.h) * t;
+                if (probe.y < top - 2) probe.y = top;
+                if (gdSpikeHit(probe, o, sx)) return true;
+            }
+        } else if (o.type === "sawblade") {
+            for (let t = 0; t <= 1.001; t += 0.1) {
+                probe.y = top + (bot - top - gdCube.h) * Math.min(1, t);
+                if (gdSawbladeHit(probe, o, sx)) return true;
+            }
+        } else if (o.type === "hazard") {
+            const oy0 = o.y, oy1 = o.y + o.h;
+            if (right > sx + 2 && left < sx + o.w - 2 && bot > oy0 + 2 && top < oy1 - 2) return true;
+        }
+    }
+    return false;
+}
+
 function gdSpikeHit(cube, o, sx) {
     if (!cube || !o) return false;
-    if (o.type !== "spike" && o.type !== "spikeDown") return false;
-    // Build upward triangle in local space, then apply type+rot around center
-    // so hitbox matches the drawn rotated spike.
-    const cx = sx + o.w * 0.5;
-    const cy = o.y + o.h * 0.5;
-    const baseRot = (o.type === "spikeDown") ? 180 : 0;
-    const totalDeg = baseRot + (Number(o.rot) || 0);
-    const rad = radians(totalDeg);
-    const c = Math.cos(rad), s = Math.sin(rad);
-    // local verts: tip at top, base at bottom (matches draw triangle)
-    const local = [
-        [-o.w * 0.5,  o.h * 0.5],
-        [ 0,         -o.h * 0.5],
-        [ o.w * 0.5,  o.h * 0.5]
-    ];
-    const world = local.map(([lx, ly]) => [cx + lx * c - ly * s, cy + lx * s + ly * c]);
-    const x1 = world[0][0], y1 = world[0][1];
-    const x2 = world[1][0], y2 = world[1][1]; // tip
-    const x3 = world[2][0], y3 = world[2][1];
+    let x1, y1, x2, y2, x3, y3;
+    if (o.type === "spike") {
+        x1 = sx; y1 = o.y + o.h;
+        x2 = sx + o.w * 0.5; y2 = o.y;
+        x3 = sx + o.w; y3 = o.y + o.h;
+    } else if (o.type === "spikeDown") {
+        x1 = sx; y1 = o.y;
+        x2 = sx + o.w * 0.5; y2 = o.y + o.h;
+        x3 = sx + o.w; y3 = o.y;
+    } else return false;
     const pts = [
         [cube.x + 3, cube.y + 3],
         [cube.x + cube.w - 3, cube.y + 3],
@@ -8239,41 +8466,85 @@ function gdFlyingBlockCollide(cube, o, sx) {
     // Classic: side / front → lethal
     return true;
 }
-function gdSlopeSurfaceY(o, sx, worldX) {
-    const t = constrain((worldX - sx) / Math.max(1, o.w), 0, 1);
-    if (o.dir > 0) return (o.y + o.h) - t * o.h; // /
-    return o.y + t * o.h; // \
+// Solid slope triangle verts in screen space (respects o.rot around center)
+function gdSlopeVerts(o, sx) {
+    // base (no rot): dir>0 = /  (bl, br, tr); dir<0 = \ (tl, bl, br)
+    let local;
+    if ((o.dir || 1) > 0) {
+        local = [
+            [-o.w / 2,  o.h / 2], // bl
+            [ o.w / 2,  o.h / 2], // br
+            [ o.w / 2, -o.h / 2]  // tr
+        ];
+    } else {
+        local = [
+            [-o.w / 2, -o.h / 2], // tl
+            [-o.w / 2,  o.h / 2], // bl
+            [ o.w / 2,  o.h / 2]  // br
+        ];
+    }
+    const cx = sx + o.w / 2, cy = o.y + o.h / 2;
+    const rot = Number(o.rot) || 0;
+    if (!rot) {
+        return local.map(([lx, ly]) => [cx + lx, cy + ly]);
+    }
+    const rad = radians(rot);
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return local.map(([lx, ly]) => [cx + lx * c - ly * s, cy + lx * s + ly * c]);
 }
-// Flying on slopes: rest on the diagonal; die only if deep inside solid or side-crush
+
+function gdSlopeSurfaceY(o, sx, worldX) {
+    const rot = ((Number(o.rot) || 0) % 360 + 360) % 360;
+    if (!rot) {
+        const t = constrain((worldX - sx) / Math.max(1, o.w), 0, 1);
+        if ((o.dir || 1) > 0) return (o.y + o.h) - t * o.h; // /
+        return o.y + t * o.h; // \
+    }
+    // Rotated: walkable edge ≈ the edge with smallest average Y (top for normal gravity)
+    const verts = gdSlopeVerts(o, sx);
+    const edges = [[verts[0], verts[1]], [verts[1], verts[2]], [verts[0], verts[2]]];
+    let best = edges[2], bestScore = 1e9;
+    for (const e of edges) {
+        const score = (e[0][1] + e[1][1]) * 0.5;
+        if (score < bestScore) { bestScore = score; best = e; }
+    }
+    const a = best[0], b = best[1];
+    const minX = Math.min(a[0], b[0]), maxX = Math.max(a[0], b[0]);
+    if (maxX - minX < 1e-3) return (a[1] + b[1]) * 0.5;
+    if (worldX < minX - 4 || worldX > maxX + 4) return Math.min(a[1], b[1]);
+    const t = constrain((worldX - a[0]) / (b[0] - a[0]), 0, 1);
+    return a[1] + t * (b[1] - a[1]);
+}
+// Flying on slopes: rest on the diagonal; die only if deep inside solid
 function gdFlyingSlopeCollide(cube, o, sx) {
     if (!cube || !o) return false;
+    const verts = gdSlopeVerts(o, sx);
+    const xs = verts.map(v => v[0]), ys = verts.map(v => v[1]);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
     const cl = cube.x + 2, cr = cube.x + cube.w - 2, ct = cube.y + 2, cb = cube.y + cube.h - 2;
-    if (cr <= sx || cl >= sx + o.w || cb <= o.y || ct >= o.y + o.h) return false;
+    if (cr <= minX || cl >= maxX || cb <= minY || ct >= maxY) return false;
     const cx = cube.x + cube.w * 0.5;
     const surfaceY = gdSlopeSurfaceY(o, sx, cx);
-    // Support from above the ramp
-    if (cb >= surfaceY - 8 && cb <= surfaceY + 16) {
+    // Support from above the ramp (generous so ship/ufo/wave don't die on contact)
+    if (cb >= surfaceY - 12 && cb <= surfaceY + 28) {
         cube.y = surfaceY - cube.h;
         if (cube.vy > 0) cube.vy = 0;
         return false;
     }
-    // Support from below (underside of ramp) — rare for fly
-    if (ct <= surfaceY + 8 && ct >= surfaceY - 16) {
+    // Support from below
+    if (ct <= surfaceY + 12 && ct >= surfaceY - 28) {
         cube.y = surfaceY;
         if (cube.vy < 0) cube.vy = 0;
         return false;
     }
-    // Deep inside solid wedge → death
-    let x1, y1, x2, y2, x3, y3;
-    if (o.dir > 0) {
-        x1 = sx; y1 = o.y + o.h; x2 = sx + o.w; y2 = o.y + o.h; x3 = sx + o.w; y3 = o.y;
-    } else {
-        x1 = sx; y1 = o.y; x2 = sx; y2 = o.y + o.h; x3 = sx + o.w; y3 = o.y + o.h;
+    // Deep inside solid wedge → death only if clearly below the surface
+    const midY = cube.y + cube.h * 0.5;
+    if (midY > surfaceY + 14 &&
+        gdPointInTri(cx, midY, verts[0][0], verts[0][1], verts[1][0], verts[1][1], verts[2][0], verts[2][1])) {
+        return true;
     }
-    const midX = cube.x + cube.w * 0.5, midY = cube.y + cube.h * 0.5;
-    if (gdPointInTri(midX, midY, x1, y1, x2, y2, x3, y3)) return true;
-    // side approach into bounding box without surface contact
-    return gdFlyingBlockCollide(cube, o, sx);
+    return false;
 }
 function gdFlyingFrontHit(cube, o, sx) {
     if (o && o.type === "slope") return gdFlyingSlopeCollide(cube, o, sx);
@@ -8652,20 +8923,16 @@ function drawGeometryDash() {
 
     for (let o of gdObstacles) {
         let sx = o.x - gdScroll;
-        if (sx < -100 || sx > sirina + 60) continue;
-        if (o.type === "spike" || o.type === "spikeDown") {
+        // Visible if ANY part is on screen (long slopes/wave must not vanish when start is off-edge)
+        const ow = (o.w != null) ? o.w : 40;
+        if (sx + ow < -40 || sx > sirina + 40) continue;
+        if (o.type === "spike") {
             fill(230, 50, 70);
-            const cx = sx + o.w / 2, cy = o.y + o.h / 2;
-            // Base triangle points up; spikeDown + rot handled together
-            let baseRot = (o.type === "spikeDown") ? 180 : 0;
-            const totalRot = baseRot + (Number(o.rot) || 0);
-            push();
-            translate(cx, cy);
-            rotate(radians(totalRot));
-            triangle(-o.w / 2, o.h / 2, 0, -o.h / 2, o.w / 2, o.h / 2);
-            pop();
+            triangle(sx, o.y + o.h, sx + o.w / 2, o.y, sx + o.w, o.y + o.h);
+        } else if (o.type === "spikeDown") {
+            fill(230, 50, 70);
+            triangle(sx, o.y, sx + o.w / 2, o.y + o.h, sx + o.w, o.y);
         } else if (o.type === "block" || o.type === "wall") {
-            // w/h already swapped for 90/270 at build time — draw axis-aligned
             fill(50, 200, 230); stroke(20); strokeWeight(2);
             rect(sx, o.y, o.w, o.h, 3);
             noStroke();
@@ -8701,13 +8968,10 @@ function drawGeometryDash() {
             fill(20); noStroke(); textAlign(CENTER, CENTER); textSize(9);
             text(on ? "SAVE" : "CP", sx + o.w / 2, o.y + o.h / 2);
         } else if (o.type === "slope") {
-            // cut block slope: dir 1 = /, dir -1 = \
+            // cut block slope — verts respect o.rot (same as editor + hitbox)
             fill(50, 200, 230); stroke(20); strokeWeight(2);
-            if (o.dir > 0) {
-                triangle(sx, o.y + o.h, sx + o.w, o.y + o.h, sx + o.w, o.y);
-            } else {
-                triangle(sx, o.y, sx, o.y + o.h, sx + o.w, o.y + o.h);
-            }
+            const sv = gdSlopeVerts(o, sx);
+            triangle(sv[0][0], sv[0][1], sv[1][0], sv[1][1], sv[2][0], sv[2][1]);
             noStroke();
         } else if (o.type === "secretCoin" || o.type === "secretCoinGot") {
             if (o.type === "secretCoinGot") continue;
@@ -8715,18 +8979,24 @@ function drawGeometryDash() {
             fill(255, 215 * pulse, 40); stroke(255, 255, 180); strokeWeight(2);
             ellipse(sx + o.w / 2, o.y + o.h / 2, o.w * pulse, o.h * pulse);
             noStroke();
-        } else if (o.type === "padYellow") {
-            // yellow jump pad
-            fill(255, 220, 40); stroke(200, 160, 0); strokeWeight(2);
-            rect(sx, o.y, o.w, o.h, 3);
-            fill(255, 255, 180); noStroke();
-            triangle(sx + o.w * 0.2, o.y + o.h - 3, sx + o.w / 2, o.y + 2, sx + o.w * 0.8, o.y + o.h - 3);
-        } else if (o.type === "padBlue") {
-            // blue gravity pad
-            fill(60, 140, 255); stroke(20, 80, 200); strokeWeight(2);
-            rect(sx, o.y, o.w, o.h, 3);
-            fill(180, 220, 255); noStroke();
-            ellipse(sx + o.w / 2, o.y + o.h / 2, o.w * 0.45, o.h * 0.7);
+        } else if (o.type === "padYellow" || o.type === "padPink" || o.type === "padBlue") {
+            // Pad body + arrow in effect direction (from ROT)
+            const cols = o.type === "padBlue" ? [60, 140, 255] : (o.type === "padPink" ? [255, 50, 50] : [255, 220, 40]);
+            fill(cols[0], cols[1], cols[2]); stroke(20); strokeWeight(2);
+            const cx = sx + o.w / 2, cy = o.y + o.h / 2;
+            // Map axis/facing → arrow rotation (0 = up)
+            let arrowRot = 0;
+            if ((o.axis || "y") === "x") arrowRot = (o.facing > 0) ? 90 : 270;
+            else arrowRot = (o.facing > 0) ? 0 : 180;
+            // Prefer explicit editor rot when present
+            if (o.rot != null && o.rot !== 0) arrowRot = Number(o.rot);
+            push();
+            translate(cx, cy);
+            rotate(radians(arrowRot));
+            rect(-o.w / 2, -o.h / 2, o.w, o.h, 3);
+            fill(255, 255, 220); noStroke();
+            triangle(-o.w * 0.3, o.h * 0.25, 0, -o.h * 0.35, o.w * 0.3, o.h * 0.25);
+            pop();
         } else if (o.type === "orbYellow") {
             const pulse = 0.85 + sin(frameCount * 0.25) * 0.15;
             fill(255, 220, 50, 200); noStroke();
@@ -8777,11 +9047,6 @@ function drawGeometryDash() {
                 ellipse(cx, cy, o.w + 14 + (frameCount % 8), o.h + 14 + (frameCount % 8));
                 noStroke();
             }
-        } else if (o.type === "padPink") {
-            fill(255, 50, 50); stroke(180, 20, 20); strokeWeight(2);
-            rect(sx, o.y, o.w, o.h, 3);
-            fill(255, 180, 180); noStroke();
-            triangle(sx + o.w * 0.2, o.y + o.h - 3, sx + o.w / 2, o.y + 2, sx + o.w * 0.8, o.y + o.h - 3);
         } else if (o.type === "orbPink") {
             const pulse = 0.85 + sin(frameCount * 0.25) * 0.15;
             fill(255, 70, 70, 210); noStroke();
@@ -8948,6 +9213,19 @@ function drawGeometryDash() {
         beginShape();
         for (let pt of gdWaveTrail2) vertex(pt.x - gdScroll, pt.y);
         endShape();
+        noStroke();
+    }
+
+    // Spider teleport trail — fixed in world space (does not follow player)
+    if (gdSpiderTrail && gdSpiderTrail.life > 0) {
+        const a = constrain(gdSpiderTrail.life / 22, 0, 1);
+        const tx = (gdSpiderTrail.worldX != null ? gdSpiderTrail.worldX : gdSpiderTrail.x) - gdScroll;
+        stroke(200, 120, 255, 220 * a);
+        strokeWeight(3);
+        line(tx, gdSpiderTrail.y0, tx, gdSpiderTrail.y1);
+        stroke(255, 220, 255, 160 * a);
+        strokeWeight(1.5);
+        line(tx, gdSpiderTrail.y0, tx, gdSpiderTrail.y1);
         noStroke();
     }
 
@@ -9122,16 +9400,12 @@ function drawGeometryDash() {
             const oy = o.y != null ? o.y : 0;
             if (sx + ow < -30 || sx > sirina + 30) continue;
             strokeWeight(1.5);
-            if (o.type === "spike" || o.type === "spikeDown") {
+            if (o.type === "spike") {
                 stroke(255, 50, 50, 230);
-                const cx = sx + ow * 0.5, cy = oy + oh * 0.5;
-                const baseRot = (o.type === "spikeDown") ? 180 : 0;
-                const totalRot = baseRot + (Number(o.rot) || 0);
-                push();
-                translate(cx, cy);
-                rotate(radians(totalRot));
-                triangle(-ow * 0.5, oh * 0.5, 0, -oh * 0.5, ow * 0.5, oh * 0.5);
-                pop();
+                triangle(sx, oy + oh, sx + ow * 0.5, oy, sx + ow, oy + oh);
+            } else if (o.type === "spikeDown") {
+                stroke(255, 50, 50, 230);
+                triangle(sx, oy, sx + ow * 0.5, oy + oh, sx + ow, oy);
             } else if (o.type === "sawblade") {
                 stroke(255, 80, 40, 230);
                 const r = Math.min(ow, oh) * 0.48;
@@ -11147,7 +11421,7 @@ function draw() {
             textSize(11); textAlign(LEFT, CENTER);
             const recordGroups = [
                 { title: "SNAKE", items: modes.filter(m => !m.startsWith("GD ") && !["GD Portal Level","Stereo Madness","Wave Skill Tester","Pulse Factory","Tower Climb"].includes(m)) },
-                { title: "GEOMETRY DASH", items: modes.filter(m => m.startsWith("GD ") || m === "GD Portal Level" || m === "Stereo Madness" || m === "Wave Skill Tester" || m === "Pulse Factory" || m === "Grok Showcase") },
+                { title: "GEOMETRY DASH", items: modes.filter(m => m.startsWith("GD ") || m === "GD Portal Level" || m === "Stereo Madness" || m === "Wave Skill Tester" || m === "Pulse Factory") },
                 { title: "ENDLESS", items: ["Tower Climb"] }
             ];
             let gx = [22, 312, 312], gy = [78, 78, 355];
@@ -13092,7 +13366,8 @@ function premakniHrano() {
 }
 
 function keyPressed() {
-    if ((gameMode === "Tower Climb" || gameMode === "Geometry Dash" || gameMode.startsWith("GD ")) && (key === "i" || key === "I")) {
+    // I = AI pilot (Wave, Ship, and other GD modes still supported)
+    if ((gameMode === "Tower Climb" || gameMode === "Geometry Dash" || gameMode === "GD Ship" || gameMode === "GD Wave" || gameMode.startsWith("GD ")) && (key === "i" || key === "I")) {
         if (gameMode === "Tower Climb") tower.ai = !tower.ai;
         else gdAIPilot = !gdAIPilot;
         return;
