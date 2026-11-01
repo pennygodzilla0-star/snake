@@ -308,7 +308,7 @@ let isCustomMode = false;
 let vPodmenijuAILab = false;
 let vPodmenijuLevelBuilder = false;
 let aiLabProfile = 0; // 0 Safe, 1 Risky, 2 Perfect, 3 Learning
-let aiLabVehicle = 0; // 0 Cube, 1 Ship, 2 Wave, 3 Swing, 4 Robot, 5 UFO, 6 Ball, 7 Spider, 8 Dart, 9 Mini
+let aiLabVehicle = 0; // 0 Cube … 8 Dart (no Mini mode — use mini portal)
 let aiLearningStats = {
     deaths: 0, spike: 0, gap: 0, ceiling: 0, timing: 0,
     learningLevel: {},
@@ -377,6 +377,24 @@ let levelBuilder = {
     slopeMode: 1, // wave: 0 = flat, 1 = up 45°, -1 = down 45°
     cellMeta: {}, // "r,c" -> { target } for per-portal vehicle
     scrollC: 0, // horizontal editor scroll (columns)
+    toolScroll: 0, // scroll offset for tool palette
+    musicUrl: "", // optional custom level music (URL)
+    draggingScroll: false,
+    draggingToolScroll: false,
+    decoCells: {}, // legacy
+    decoStrokes: [], // legacy freehand
+    decoDrawing: false,
+    decoEditor: false,
+    decoColor: [210, 160, 255],
+    decoSize: 0.35,
+    decoPreset: null,
+    // Pixel-art decorations (like custom head)
+    decoDraft: null, // 8x8 color indices 0..8
+    decoLibrary: [], // [{ name, grid }]
+    decoLibIdx: 0, // selected sprite to place
+    decoPlacements: {}, // "r,c" -> { libIdx, grid } stamped on level
+    decoPaintColor: 1,
+
     undoStack: [], redoStack: [], historyLimit: 80, dragPaintLast: "", selectedCell: null, selectedCells: [], selectMode: false, savedPage: 0,
     showHitboxes: false
 };
@@ -429,7 +447,9 @@ const levelBuilderToolsGD = [
     // True blue (grav flip only) + black (slam) — existing orbBlue is green-behavior (kept for saves)
     "orbBlueTrue", "orbBlack",
     // NEW append-only (do not reorder above)
-    "startPos", "checkpoint"
+    "startPos", "checkpoint",
+    // Editor utilities (append only)
+    "erase", "deco"
 ];
 const levelBuilderTools = levelBuilderToolsGD;
 const LB_PORTAL_TARGETS = ["cube", "ship", "wave", "ufo", "ball", "robot", "swing", "spider", "dart", "mini"];
@@ -463,7 +483,7 @@ const modes = [
     "Chaser", "Minefield", "Boss Rush", "Multiplayer",
     "Time Warp", "Homing Food", "Boss Fight", "Echo Shadow",
     "Mirror Snake", "Gravity", "Platformer", "Geometry Dash", "GD Ship", "GD Wave", "GD Swing", "GD Robot", "GD UFO", "GD Ball",
-    "GD Spider", "GD Dart", "GD Mini", "Daily Challenge",
+    "GD Spider", "GD Dart", "Daily Challenge",
     "Custom Mode", "Ghost Race", "GD Portal Level", "Stereo Madness", "Wave Skill Tester", "Pulse Factory", "Tower Climb",
     "Snake+GD Hybrid"
 ];
@@ -1294,7 +1314,7 @@ function drawAILabMenu() {
     const pd=["SAFE: zgodaj + velike varnostne rezerve","RISKY: pozno + krajši odzivni okni","PERFECT: dolga napoved + simulacija","LEARNING: po vsaki smrti skoči prej + večja rezerva"];
     text(pd[aiLabProfile], sirina/2, 82);
     const profiles = ["SAFE AI", "RISKY AI", "PERFECT AI", "LEARNING AI"];
-    const vehicles = ["CUBE", "SHIP", "WAVE", "SWING", "ROBOT", "UFO", "BALL", "SPIDER", "DART", "MINI"];
+    const vehicles = ["CUBE", "SHIP", "WAVE", "SWING", "ROBOT", "UFO", "BALL", "SPIDER", "DART"];
     for (let i=0;i<profiles.length;i++) {
         fill(i===aiLabProfile ? color(0,255,170) : color(120));
         rect(45, 100+i*48, 195, 34, 8);
@@ -1320,20 +1340,306 @@ function drawAILabMenu() {
 }
 
 function aiLabVehicleMode() {
-    return ["Geometry Dash","GD Ship","GD Wave","GD Swing","GD Robot","GD UFO","GD Ball","GD Spider","GD Dart","GD Mini"][aiLabVehicle];
+    return ["Geometry Dash","GD Ship","GD Wave","GD Swing","GD Robot","GD UFO","GD Ball","GD Spider","GD Dart"][aiLabVehicle];
+}
+
+
+
+// Built-in decoration presets (unit space -0.5..0.5), scaled on place
+const LB_DECO_PRESETS = {
+    star: () => {
+        const pts = [];
+        for (let i = 0; i < 10; i++) {
+            const a = -HALF_PI + i * PI / 5;
+            const r = (i % 2 === 0) ? 0.48 : 0.2;
+            pts.push({ x: cos(a) * r, y: sin(a) * r });
+        }
+        pts.push(pts[0]);
+        return pts;
+    },
+    heart: () => {
+        const pts = [];
+        for (let i = 0; i <= 24; i++) {
+            const t = i / 24 * TWO_PI;
+            const x = 0.35 * Math.pow(Math.sin(t), 3);
+            const y = -0.3 * (0.85 * Math.cos(t) - 0.3 * Math.cos(2 * t) - 0.12 * Math.cos(3 * t) - 0.05 * Math.cos(4 * t));
+            pts.push({ x, y });
+        }
+        return pts;
+    },
+    circle: () => {
+        const pts = [];
+        for (let i = 0; i <= 20; i++) {
+            const a = i / 20 * TWO_PI;
+            pts.push({ x: cos(a) * 0.42, y: sin(a) * 0.42 });
+        }
+        return pts;
+    },
+    square: () => [
+        { x: -0.4, y: -0.4 }, { x: 0.4, y: -0.4 }, { x: 0.4, y: 0.4 }, { x: -0.4, y: 0.4 }, { x: -0.4, y: -0.4 }
+    ],
+    diamond: () => [
+        { x: 0, y: -0.48 }, { x: 0.42, y: 0 }, { x: 0, y: 0.48 }, { x: -0.42, y: 0 }, { x: 0, y: -0.48 }
+    ],
+    arrow: () => [
+        { x: -0.4, y: -0.15 }, { x: 0.15, y: -0.15 }, { x: 0.15, y: -0.35 }, { x: 0.48, y: 0 },
+        { x: 0.15, y: 0.35 }, { x: 0.15, y: 0.15 }, { x: -0.4, y: 0.15 }, { x: -0.4, y: -0.15 }
+    ],
+    gem: () => [
+        { x: 0, y: -0.48 }, { x: 0.35, y: -0.15 }, { x: 0.28, y: 0.4 }, { x: 0, y: 0.48 },
+        { x: -0.28, y: 0.4 }, { x: -0.35, y: -0.15 }, { x: 0, y: -0.48 }
+    ],
+    bolt: () => [
+        { x: 0.05, y: -0.48 }, { x: -0.15, y: -0.05 }, { x: 0.05, y: -0.05 }, { x: -0.2, y: 0.48 },
+        { x: 0.25, y: 0.05 }, { x: 0.0, y: 0.05 }, { x: 0.3, y: -0.48 }, { x: 0.05, y: -0.48 }
+    ],
+    smile: () => {
+        const pts = [];
+        for (let i = 0; i <= 16; i++) {
+            const a = i / 16 * TWO_PI;
+            pts.push({ x: cos(a) * 0.42, y: sin(a) * 0.42 });
+        }
+        return pts;
+    },
+    cloud: () => {
+        const pts = [];
+        const blobs = [[-0.2, 0.05, 0.22], [0.05, -0.05, 0.28], [0.28, 0.08, 0.2], [-0.05, 0.12, 0.18]];
+        for (const [cx, cy, r] of blobs) {
+            for (let i = 0; i <= 10; i++) {
+                const a = i / 10 * TWO_PI;
+                pts.push({ x: cx + cos(a) * r, y: cy + sin(a) * r * 0.7 });
+            }
+        }
+        return pts;
+    }
+};
+const LB_DECO_COLORS = [
+    [210, 160, 255], [255, 80, 120], [255, 200, 40], [80, 220, 120],
+    [80, 180, 255], [255, 140, 40], [255, 255, 255], [40, 40, 50]
+];
+const LB_DECO_PRESET_NAMES = Object.keys(LB_DECO_PRESETS);
+
+
+const DECO_GRID_SIZE = 8;
+const DECO_PIXEL = 28;
+
+function lbDecoGridFromRows(rows) {
+    // rows: 8 strings of 8 chars, chars '0'-'8' or space=0
+    const g = lbDecoEmptyGrid();
+    for (let j = 0; j < Math.min(8, rows.length); j++) {
+        const line = rows[j];
+        for (let i = 0; i < Math.min(8, line.length); i++) {
+            const ch = line[i];
+            g[i][j] = (ch === ' ' || ch === '.') ? 0 : (parseInt(ch, 10) || 0);
+        }
+    }
+    return g;
+}
+function lbDecoSeedLibrary() {
+    // No built-in presets — user creates their own in the pixel editor
+    if (!levelBuilder.decoLibrary) levelBuilder.decoLibrary = [];
+    if (!levelBuilder.decoDraft) levelBuilder.decoDraft = lbDecoEmptyGrid();
+}
+
+function lbDecoEmptyGrid() {
+    const g = [];
+    for (let i = 0; i < DECO_GRID_SIZE; i++) {
+        g[i] = [];
+        for (let j = 0; j < DECO_GRID_SIZE; j++) g[i][j] = 0;
+    }
+    return g;
+}
+function lbDecoEnsureDraft() {
+    if (!levelBuilder.decoDraft) levelBuilder.decoDraft = lbDecoEmptyGrid();
+    return levelBuilder.decoDraft;
+}
+function lbDecoSaveDraftToLibrary() {
+    const draft = lbDecoEnsureDraft();
+    // skip empty
+    let has = false;
+    for (let i = 0; i < DECO_GRID_SIZE; i++)
+        for (let j = 0; j < DECO_GRID_SIZE; j++)
+            if (draft[i][j]) has = true;
+    if (!has) { levelBuilder.msg = "Deco empty — paint pixels first"; return; }
+    if (!levelBuilder.decoLibrary) levelBuilder.decoLibrary = [];
+    const copy = JSON.parse(JSON.stringify(draft));
+    levelBuilder.decoLibrary.push({ name: "Deco " + (levelBuilder.decoLibrary.length + 1), grid: copy });
+    levelBuilder.decoLibIdx = levelBuilder.decoLibrary.length - 1;
+    levelBuilder.msg = "Saved deco #" + levelBuilder.decoLibrary.length + " — place with DECO tool";
+}
+function lbDecoGetPlaceGrid() {
+    if (levelBuilder.decoLibrary && levelBuilder.decoLibrary.length && levelBuilder.decoLibIdx >= 0) {
+        const item = levelBuilder.decoLibrary[levelBuilder.decoLibIdx];
+        if (item && item.grid) return item.grid;
+    }
+    return levelBuilder.decoDraft;
+}
+function lbDecoShapeOf(tname) {
+    if (!tname) return "rect";
+    if (tname === "spike") return "spikeUp";
+    if (tname === "spikeDown") return "spikeDown";
+    if (tname === "block" || tname === "wall") return "block";
+    if (tname.indexOf("orb") >= 0 || tname === "sawblade" || tname === "secretCoin") return "circle";
+    if (tname.indexOf("portal") >= 0 || tname === "gravityUp" || tname === "gravityDown"
+        || tname === "sizeMini" || tname === "sizeNormal" || tname === "endDual") return "portal";
+    if (tname.indexOf("pad") >= 0) return "pad";
+    if (tname === "slope") return "slope";
+    if (tname === "slopeFlip") return "slopeFlip";
+    if (tname === "waveSlope") return "slope";
+    if (tname === "end") return "goal";
+    return "rect";
+}
+function lbDecoPointInShape(shape, lx, ly, w, h) {
+    if (shape === "spikeUp") {
+        // barycentric: (0,h), (w/2,0), (w,h)
+        const x1 = 0, y1 = h, x2 = w * 0.5, y2 = 0, x3 = w, y3 = h;
+        const d = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3);
+        if (Math.abs(d) < 1e-9) return false;
+        const a = ((y2 - y3) * (lx - x3) + (x3 - x2) * (ly - y3)) / d;
+        const b = ((y3 - y1) * (lx - x3) + (x1 - x3) * (ly - y3)) / d;
+        const c = 1 - a - b;
+        return a >= -0.02 && b >= -0.02 && c >= -0.02;
+    }
+    if (shape === "spikeDown") {
+        const x1 = 0, y1 = 0, x2 = w * 0.5, y2 = h, x3 = w, y3 = 0;
+        const d = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3);
+        if (Math.abs(d) < 1e-9) return false;
+        const a = ((y2 - y3) * (lx - x3) + (x3 - x2) * (ly - y3)) / d;
+        const b = ((y3 - y1) * (lx - x3) + (x1 - x3) * (ly - y3)) / d;
+        const c = 1 - a - b;
+        return a >= -0.02 && b >= -0.02 && c >= -0.02;
+    }
+    if (shape === "circle" || shape === "portal") {
+        const dx = (lx - w * 0.5) / (w * 0.48);
+        const dy = (ly - h * 0.5) / (h * 0.48);
+        return dx * dx + dy * dy <= 1.05;
+    }
+    if (shape === "pad") {
+        return ly >= h * 0.5 && ly <= h && lx >= 0 && lx <= w;
+    }
+    if (shape === "slope") {
+        // / lower-right filled: ly >= h * (1 - lx/w)
+        return ly >= h * (1 - lx / Math.max(1e-6, w)) - 0.5;
+    }
+    if (shape === "slopeFlip") {
+        // \ lower-left filled: ly >= h * (lx/w)
+        return ly >= h * (lx / Math.max(1e-6, w)) - 0.5;
+    }
+    if (shape === "goal") {
+        return lx <= w * 0.4;
+    }
+    return true; // block / rect
+}
+function lbDecoFillShape(shape, x, y, w, h, col) {
+    noStroke();
+    fill(col[0], col[1], col[2], col[3] != null ? col[3] : 255);
+    if (shape === "spikeUp") {
+        triangle(x, y + h, x + w * 0.5, y, x + w, y + h);
+    } else if (shape === "spikeDown") {
+        triangle(x, y, x + w * 0.5, y + h, x + w, y);
+    } else if (shape === "circle" || shape === "portal") {
+        ellipse(x + w * 0.5, y + h * 0.5, w * 0.95, h * 0.95);
+    } else if (shape === "pad") {
+        rect(x, y + h * 0.5, w, h * 0.5, 2);
+    } else if (shape === "slope") {
+        // black/filled / triangle (bl, br, tr)
+        triangle(x, y + h, x + w, y + h, x + w, y);
+    } else if (shape === "slopeFlip") {
+        // \ triangle (bl, br, tl)
+        triangle(x, y + h, x + w, y + h, x, y);
+    } else if (shape === "block") {
+        rect(x, y, w, h, 4);
+    } else if (shape === "goal") {
+        rect(x, y, w * 0.4, h);
+    } else {
+        rect(x, y, w, h, 2);
+    }
+}
+/** Draw deco texture clipped to object shape. Always paints solid underlay first so object is fully covered. */
+function lbDecoDrawGridPixels(grid, x, y, cellW, cellH, shape) {
+    if (!grid) return;
+    shape = shape || "rect";
+    const n = typeof DECO_GRID_SIZE === "number" ? DECO_GRID_SIZE : 8;
+    const pw = cellW / n, ph = cellH / n;
+    // 1) solid cover in exact object shape (black for slopes, dark for rest)
+    const under = (shape === "slope" || shape === "slopeFlip")
+        ? [0, 0, 0, 255]
+        : [10, 10, 18, 255];
+    lbDecoFillShape(shape, x, y, cellW, cellH, under);
+    // 2) paint pixels only inside shape
+    noStroke();
+    for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+            const ci = grid[i] && grid[i][j];
+            if (!ci) continue;
+            const cx = (i + 0.5) * pw;
+            const cy = (j + 0.5) * ph;
+            if (!lbDecoPointInShape(shape, cx, cy, cellW, cellH)) continue;
+            const pal = (typeof headPalette !== "undefined" && headPalette[ci]) ? headPalette[ci] : [210, 160, 255];
+            fill(pal[0], pal[1], pal[2], 255);
+            rect(x + i * pw, y + j * ph, Math.max(1, pw + 0.5), Math.max(1, ph + 0.5));
+        }
+    }
+}
+function lbDecoEraseAt(r, c) {
+    const key = r + "," + c;
+    let changed = false;
+    if (levelBuilder.decoPlacements && levelBuilder.decoPlacements[key]) {
+        delete levelBuilder.decoPlacements[key];
+        changed = true;
+    }
+    if (levelBuilder.decoCells && levelBuilder.decoCells[key]) {
+        delete levelBuilder.decoCells[key];
+        changed = true;
+    }
+    // Remove freehand strokes that touch this cell
+    if (levelBuilder.decoStrokes && levelBuilder.decoStrokes.length) {
+        const before = levelBuilder.decoStrokes.length;
+        levelBuilder.decoStrokes = levelBuilder.decoStrokes.filter(st => {
+            if (!st.pts) return false;
+            for (const p of st.pts) {
+                if (Math.floor(p.x) === c && Math.floor(p.y) === r) return false;
+                // also if near cell
+                if (Math.abs(p.x - (c + 0.5)) < 0.75 && Math.abs(p.y - (r + 0.5)) < 0.75) return false;
+            }
+            return true;
+        });
+        if (levelBuilder.decoStrokes.length !== before) changed = true;
+    }
+    return changed;
+}
+
+
+function lbDecoStampPreset(name, cellX, cellY, scale) {
+    const gen = LB_DECO_PRESETS[name];
+    if (!gen) return null;
+    const unit = gen();
+    const s = scale || 1.2;
+    const pts = unit.map(p => ({ x: cellX + p.x * s, y: cellY + p.y * s }));
+    return {
+        pts,
+        color: (levelBuilder.decoColor || [210, 160, 255]).slice(),
+        size: levelBuilder.decoSize || 0.3,
+        preset: name
+    };
 }
 
 
 function builderLayout() {
-    const gx = 12, gy = 62, cw = 16;
-    const bottomReserve = 118;
+    const gx = 12, gy = 58, cw = 16;
+    // Bottom stack: scrollbar(12) + tools(3*18=54) + gap + btns(22) + saved(40) + pad
+    const bottomReserve = 12 + 54 + 6 + 22 + 40 + 8;
     const gridMaxH = Math.max(80, sirina - gy - bottomReserve);
-    const ch = constrain(Math.floor(gridMaxH / Math.max(1, levelBuilder.rows)), 10, 18);
-    const toolsY0 = gy + levelBuilder.rows * ch + 4;
+    const ch = constrain(Math.floor(gridMaxH / Math.max(1, levelBuilder.rows)), 10, 16);
+    const gridH = levelBuilder.rows * ch;
+    const barY = gy + gridH + 2;
+    const toolsY0 = barY + 14; // below scrollbar
     const perRow = 8;
-    const oldCount = typeof LB_OLD_TOOL_COUNT === "number" ? LB_OLD_TOOL_COUNT : 16;
-    const btnY = Math.min(toolsY0 + Math.ceil(oldCount / perRow) * 20 + 4, sirina - 92);
-    return { gx, gy, cw, ch, toolsY0, perRow, oldCount, btnY, sideX: 478, sideY0: gy, sideGap: 20 };
+    const toolRowsVisible = 3;
+    const btnY = Math.min(toolsY0 + toolRowsVisible * 18 + 4, sirina - 68);
+    // MUSIC / FROM in top bar (never over grid or action buttons)
+    const sideX = 400, sideY0 = 26;
+    return { gx, gy, cw, ch, toolsY0, perRow, btnY, barY, sideX, sideY0, toolRowsVisible };
 }
 
 function drawLevelBuilderMenu() {
@@ -1371,11 +1677,33 @@ function drawLevelBuilderMenu() {
     rect(548, 26, 46, 18, 4);
     fill(255); textSize(7); text(levelBuilder.showHitboxes ? "HIT" : "HIT", 571, 35);
 
+    // Status row + MUSIC / FROM on the RIGHT (own row, no overlap with top buttons)
     fill(180); textSize(8); textAlign(LEFT, CENTER);
     const smLabel = levelBuilder.slopeMode === 0 ? "FLAT" : (levelBuilder.slopeMode === -1 ? "↓45°" : "↑45°");
-    const modeLabel = isPlat ? "PLATFORMER (free move + portals)" : "CLASSIC (auto-scroll)";
-    text((levelBuilder.name || "My Level") + "  " + levelBuilder.cols + "×" + levelBuilder.rows
-        + "  •  " + modeLabel + "  •  portal " + levelBuilder.portalTarget.toUpperCase() + " [P]  slope " + smLabel + " [R]", 12, 50);
+    const modeLabel = isPlat ? "PLAT" : "CLASSIC";
+    text((levelBuilder.name || "My Level") + " " + levelBuilder.cols + "×" + levelBuilder.rows
+        + " · " + modeLabel + " · P:" + levelBuilder.portalTarget.toUpperCase() + " · R:" + smLabel, 12, 50);
+    // Normal top buttons — same size, no overlay panels
+    const mx0 = 380, my0 = 48;
+    const decoOn = (builderCurrentTools()[levelBuilder.tool] === "deco");
+    fill(levelBuilder.musicUrl ? color(80, 180, 100) : color(45, 55, 75));
+    rect(mx0, my0, 44, 16, 3);
+    fill(255); textSize(7); textAlign(CENTER, CENTER); text("MUSIC", mx0 + 22, my0 + 8);
+    fill(90, 140, 220); rect(mx0 + 48, my0, 44, 16, 3);
+    fill(255); text("FROM", mx0 + 70, my0 + 8);
+    fill(decoOn ? color(0, 220, 160) : color(70, 50, 110));
+    rect(mx0 + 96, my0, 44, 16, 3);
+    fill(decoOn ? 10 : 255); text("PLACE", mx0 + 118, my0 + 8);
+    fill(255, 170, 50); rect(mx0 + 144, my0, 44, 16, 3);
+    fill(15); text("EDIT", mx0 + 166, my0 + 8);
+    levelBuilder._musicBtn = { x: mx0, y: my0, w: 44, h: 16 };
+    levelBuilder._fromBtn = { x: mx0 + 48, y: my0, w: 44, h: 16 };
+    levelBuilder._decoBarBtns = [
+        { x: mx0 + 96, y: my0, w: 44, h: 16, kind: "placeTool" },
+        { x: mx0 + 144, y: my0, w: 44, h: 16, kind: "panel" }
+    ];
+    // legacy alias unused
+    levelBuilder._decoEditBtn = null;
 
     const tools = builderCurrentTools();
     const toolColors = {
@@ -1392,7 +1720,9 @@ function drawLevelBuilderMenu() {
         slope: [90, 180, 255], slopeFlip: [70, 150, 230],
         sawblade: [220, 60, 60],
         startPos: [80, 255, 120],
-        checkpoint: [255, 200, 60]
+        checkpoint: [255, 200, 60],
+        erase: [255, 80, 80],
+        deco: [200, 150, 255]
     };
 
     const L = builderLayout();
@@ -1420,6 +1750,9 @@ function drawLevelBuilderMenu() {
                 }
             }
             const v = (levelBuilder.grid[r] && levelBuilder.grid[r][c]) || 0;
+            // If deco is on this cell, skip object graphic — deco draws the shape on top later
+            const decoHere = levelBuilder.decoPlacements && levelBuilder.decoPlacements[r + "," + c];
+            if (decoHere) continue;
             if (!v) continue;
             const tname = tools[v - 1] || "spike";
             const col = toolColors[tname] || [200, 200, 200];
@@ -1439,7 +1772,13 @@ function drawLevelBuilderMenu() {
             if (isPortalDraw) scale(1, cellScale);
             else scale(cellScale);
             translate(-(px + cw / 2), -(py + ch / 2));
-            if (tname === "spike") {
+            if (tname === "erase") {
+                // never drawn on grid
+            } else if (tname === "deco") {
+                fill(200, 150, 255, 160);
+                rect(px + 2, py + 2, cw - 4, ch - 4, 3);
+                fill(255); textSize(8); text("✦", px + cw / 2, py + ch / 2);
+            } else if (tname === "spike") {
                 triangle(px + 2, py + ch - 2, px + cw / 2, py + 3, px + cw - 2, py + ch - 2);
             } else if (tname === "spikeDown") {
                 triangle(px + 2, py + 2, px + cw / 2, py + ch - 3, px + cw - 2, py + 2);
@@ -1564,21 +1903,118 @@ function drawLevelBuilderMenu() {
             }
         }
     }
+    // Deco — exact same transform as host object (scale / rot / nudge)
+    if (levelBuilder.decoPlacements) {
+        for (let r = 0; r < levelBuilder.rows; r++) {
+            for (let vi = 0; vi < vis; vi++) {
+                const c = scrollC + vi;
+                if (c >= levelBuilder.cols) break;
+                const key = r + "," + c;
+                const pl = levelBuilder.decoPlacements[key];
+                if (!pl || !pl.grid) continue;
+                const vr = levelBuilder.rows - 1 - r;
+                const meta = (levelBuilder.cellMeta && levelBuilder.cellMeta[key]) || {};
+                const ox = Number(meta.ox) || 0, oy = Number(meta.oy) || 0;
+                const px = gx + vi * cw + ox * cw;
+                const py = gy + vr * ch - oy * ch;
+                const gv = (levelBuilder.grid[r] && levelBuilder.grid[r][c]) || 0;
+                const tn = gv ? (tools[gv - 1] || "") : (pl.shapeName || "");
+                let shape = pl.shape || lbDecoShapeOf(tn);
+                if (tn === "slopeFlip") shape = "slopeFlip";
+                if (tn === "slope") shape = "slope";
+                const cellScale = constrain(Number(meta.scale) || 1, 0.5, 18);
+                const isPortal = tn === "portal" || tn === "gravityUp" || tn === "gravityDown"
+                    || tn === "portalDual" || tn === "sizeMini" || tn === "sizeNormal" || tn === "endDual";
+                const srot = ((Number(meta.rot) || 0) % 360 + 360) % 360;
+                push();
+                translate(px + cw / 2, py + ch / 2);
+                if (isPortal) scale(1, cellScale);
+                else scale(cellScale);
+                if (srot && (tn === "slope" || tn === "slopeFlip" || tn === "spike" || tn === "spikeDown")) {
+                    rotate(radians(srot));
+                }
+                translate(-(px + cw / 2), -(py + ch / 2));
+                // precise footprint per type (match editor object drawing)
+                let dx = px, dy = py, dw = cw, dh = ch;
+                if (tn === "spike") {
+                    dx = px + 2; dy = py + 3; dw = cw - 4; dh = ch - 5;
+                    shape = "spikeUp";
+                } else if (tn === "spikeDown") {
+                    dx = px + 2; dy = py + 2; dw = cw - 4; dh = ch - 5;
+                    shape = "spikeDown";
+                } else if (tn === "block") {
+                    dx = px; dy = py; dw = cw; dh = ch;
+                    shape = "block";
+                } else if (tn && tn.indexOf("orb") >= 0) {
+                    dx = px + 2; dy = py + 2; dw = cw - 4; dh = ch - 4;
+                    shape = "circle";
+                } else if (isPortal) {
+                    dx = px + 2; dy = py + 1; dw = cw - 4; dh = ch - 2;
+                    shape = "portal";
+                } else if (tn && tn.indexOf("pad") >= 0) {
+                    shape = "pad";
+                } else if (tn === "slope") {
+                    shape = "slope";
+                } else if (tn === "slopeFlip") {
+                    shape = "slopeFlip";
+                }
+                lbDecoDrawGridPixels(pl.grid, dx, dy, dw, dh, shape);
+                pop();
+            }
+        }
+    }
+    // Freehand deco strokes (your custom drawing)
+    if (levelBuilder.decoStrokes && levelBuilder.decoStrokes.length) {
+        for (const st of levelBuilder.decoStrokes) {
+            if (!st.pts || !st.pts.length) continue;
+            const col = st.color || [210, 160, 255];
+            const sz = (st.size || 0.35) * cw;
+            stroke(col[0], col[1], col[2], 230);
+            strokeWeight(max(2, sz));
+            strokeJoin(ROUND); strokeCap(ROUND);
+            noFill();
+            if (st.pts.length === 1) {
+                noStroke();
+                fill(col[0], col[1], col[2], 230);
+                const p = st.pts[0];
+                const vi = p.x - scrollC, vr = levelBuilder.rows - p.y;
+                ellipse(gx + vi * cw, gy + vr * ch, sz, sz);
+            } else {
+                beginShape();
+                for (const p of st.pts) {
+                    const vi = p.x - scrollC;
+                    const vr = levelBuilder.rows - p.y;
+                    vertex(gx + vi * cw, gy + vr * ch);
+                }
+                endShape();
+            }
+        }
+        noStroke();
+    }
+
     // ground line
     stroke(120, 90, 220); strokeWeight(2);
     line(gx, gy + levelBuilder.rows * ch, gx + vis * cw, gy + levelBuilder.rows * ch);
     noStroke();
-    // scroll hint
+    // Level scrollbar (drag) — own row under grid
+    const barY = L.barY != null ? L.barY : (gy + levelBuilder.rows * ch + 2);
+    const barX = gx, barW = vis * cw, barH = 10;
+    fill(40, 45, 60); rect(barX, barY, barW, barH, 3);
     if (levelBuilder.cols > vis) {
-        fill(150); textSize(8); textAlign(CENTER, CENTER);
-        text("← → scroll cols  " + (scrollC + 1) + "-" + min(scrollC + vis, levelBuilder.cols) + " / " + levelBuilder.cols, sirina / 2, gy + levelBuilder.rows * ch + 6);
+        const maxScroll = max(0, levelBuilder.cols - vis);
+        const thumbW = max(28, barW * (vis / levelBuilder.cols));
+        const thumbX = barX + (maxScroll > 0 ? (scrollC / maxScroll) * (barW - thumbW) : 0);
+        fill(levelBuilder.draggingScroll ? color(0, 255, 180) : color(120, 140, 200));
+        rect(thumbX, barY, thumbW, barH, 3);
     }
+    fill(140); textSize(7); textAlign(LEFT, CENTER);
+    text((scrollC + 1) + "–" + min(scrollC + vis, levelBuilder.cols) + "/" + levelBuilder.cols, barX + barW + 6, barY + 5);
+    levelBuilder._scrollBar = { x: barX, y: barY, w: barW, h: barH, vis };
 
-    // Tools: old 1–16 bottom; new on right
+    // Tools palette — below scrollbar, does not overlap grid/buttons
     textAlign(CENTER, CENTER);
     const perRow = L.perRow;
     const toolsY0 = L.toolsY0;
-    const oldCount = L.oldCount;
     function lbShort(n) {
         return n.replace("padYellowCeil","padY↑").replace("padBlueCeil","padB↑")
             .replace("padPinkCeil","padP↑").replace("padPink","padP")
@@ -1589,28 +2025,48 @@ function drawLevelBuilderMenu() {
             .replace("slopeFlip","slp\\").replace("slope","slp/").replace("sawblade","saw")
             .replace("gravityUp","grav↑").replace("gravityDown","grav↓")
             .replace("secretCoin","coin").replace("waveSlope","wave").replace("spikeDown","spk↓")
-            .replace("startPos","start").replace("checkpoint","check");
+            .replace("startPos","start").replace("checkpoint","check")
+            .replace("erase","ERASE").replace("deco","DECO");
     }
-    for (let i = 0; i < Math.min(oldCount, tools.length); i++) {
-        const on = levelBuilder.tool === i;
-        fill(on ? color(0, 255, 170) : color(55));
-        const bx = 6 + (i % perRow) * 58;
-        const by = toolsY0 + floor(i / perRow) * 20;
-        rect(bx, by, 56, 18, 3);
-        fill(on ? 10 : 230); textSize(6);
-        text((i + 1) + " " + lbShort(tools[i]).slice(0, 7).toUpperCase(), bx + 28, by + 9);
+    const toolRowsVisible = L.toolRowsVisible || 3;
+    const totalToolRows = Math.ceil(tools.length / perRow);
+    const maxToolScroll = max(0, totalToolRows - toolRowsVisible);
+    levelBuilder.toolScroll = constrain(levelBuilder.toolScroll || 0, 0, maxToolScroll);
+    const tScroll = levelBuilder.toolScroll || 0;
+    for (let row = 0; row < toolRowsVisible; row++) {
+        const tr = row + tScroll;
+        if (tr >= totalToolRows) break;
+        for (let col = 0; col < perRow; col++) {
+            const i = tr * perRow + col;
+            if (i >= tools.length) break;
+            const on = levelBuilder.tool === i;
+            const isErase = tools[i] === "erase";
+            const isDeco = tools[i] === "deco";
+            fill(on ? color(0, 255, 170) : (isErase ? color(90, 30, 40) : (isDeco ? color(60, 40, 90) : color(55))));
+            const bx = 6 + col * 54;
+            const by = toolsY0 + row * 18;
+            rect(bx, by, 52, 16, 3);
+            fill(on ? 10 : 230); textSize(6);
+            text(lbShort(tools[i]).slice(0, 8).toUpperCase(), bx + 26, by + 8);
+        }
     }
-    // NEW tools — right side (compact)
-    const sideX = L.sideX, sideY0 = L.sideY0, sideGap = L.sideGap;
-    fill(140); textSize(8); text("NEW", sideX + 50, sideY0 - 12);
-    for (let i = oldCount; i < tools.length; i++) {
-        const on = levelBuilder.tool === i;
-        const si = i - oldCount;
-        fill(on ? color(0, 255, 170) : color(45, 50, 70));
-        rect(sideX, sideY0 + si * sideGap, 110, 18, 4);
-        fill(on ? 10 : 230); textSize(7);
-        text((i + 1) + " " + lbShort(tools[i]).slice(0, 9).toUpperCase(), sideX + 55, sideY0 + si * sideGap + 9);
+    const arrowX = 6 + perRow * 54 + 2;
+    fill(70); rect(arrowX, toolsY0, 18, 16, 3); fill(255); textSize(8); text("▲", arrowX + 9, toolsY0 + 8);
+    fill(70); rect(arrowX, toolsY0 + 36, 18, 16, 3); fill(255); text("▼", arrowX + 9, toolsY0 + 44);
+    // Always-visible ERASE + DECO shortcuts
+    const ei = tools.indexOf("erase"), di = tools.indexOf("deco");
+    const pinX = arrowX + 22;
+    if (ei >= 0) {
+        fill(levelBuilder.tool === ei ? color(0, 255, 170) : color(90, 30, 40));
+        rect(pinX, toolsY0, 44, 16, 3); fill(255); textSize(7); text("ERASE", pinX + 22, toolsY0 + 8);
+        levelBuilder._pinErase = { x: pinX, y: toolsY0, w: 44, h: 16, idx: ei };
     }
+    if (di >= 0) {
+        fill(levelBuilder.tool === di ? color(0, 255, 170) : color(60, 40, 90));
+        rect(pinX, toolsY0 + 20, 44, 16, 3); fill(255); textSize(7); text("DECO", pinX + 22, toolsY0 + 28);
+        levelBuilder._pinDeco = { x: pinX, y: toolsY0 + 20, w: 44, h: 16, idx: di };
+    }
+    levelBuilder._toolPanel = { y0: toolsY0, perRow, rowsVis: toolRowsVisible, maxScroll: maxToolScroll, arrowX };
 
     const btnY = L.btnY;
     textAlign(CENTER, CENTER); textSize(8);
@@ -1664,6 +2120,76 @@ function drawLevelBuilderMenu() {
     }
     fill(130); textSize(8); textAlign(RIGHT, CENTER);
     text("drag paint • arrows scroll", sirina - 8, min(btnY + 64, sirina - 8));
+
+    // ===== DECO PIXEL EDITOR (like custom head) =====
+    if (levelBuilder.decoEditor) {
+        fill(0, 0, 0, 180); rect(0, 0, sirina, sirina);
+        const px = 30, py = 40, pw = sirina - 60, ph = sirina - 80;
+        fill(18, 20, 35); stroke(160, 100, 255); strokeWeight(2);
+        rect(px, py, pw, ph, 10); noStroke();
+        fill(220, 180, 255); textSize(16); textAlign(CENTER, TOP);
+        text("✦ DECO PIXEL EDITOR", sirina / 2, py + 8);
+        fill(150); textSize(10);
+        text("Paint pixels like custom head  ·  Left = paint  ·  Right = erase pixel  ·  SAVE then place on level", sirina / 2, py + 30);
+
+        const draft = lbDecoEnsureDraft();
+        const gs = DECO_GRID_SIZE, ps = DECO_PIXEL;
+        const gx0 = sirina / 2 - (gs * ps) / 2;
+        const gy0 = py + 55;
+        // pixel grid
+        for (let i = 0; i < gs; i++) {
+            for (let j = 0; j < gs; j++) {
+                const ci = draft[i][j];
+                if (ci && headPalette[ci]) fill(headPalette[ci][0], headPalette[ci][1], headPalette[ci][2]);
+                else fill(45);
+                stroke(25); strokeWeight(1);
+                rect(gx0 + i * ps, gy0 + j * ps, ps, ps);
+            }
+        }
+        noStroke();
+        levelBuilder._decoPix = { x: gx0, y: gy0, w: gs * ps, h: gs * ps, ps, gs };
+
+        // palette
+        fill(200); textSize(11); textAlign(LEFT, CENTER); text("Colors", px + 24, gy0 + gs * ps + 24);
+        levelBuilder._decoColorBtns = [];
+        for (let c = 1; c <= 8; c++) {
+            const bx = px + 20 + (c - 1) * 42, by = gy0 + gs * ps + 36;
+            fill(headPalette[c][0], headPalette[c][1], headPalette[c][2]);
+            const on = (levelBuilder.decoPaintColor || 1) === c;
+            stroke(on ? 255 : 60); strokeWeight(on ? 3 : 1);
+            rect(bx, by, 36, 24, 4); noStroke();
+            levelBuilder._decoColorBtns.push({ x: bx, y: by, w: 36, h: 24, colorIdx: c });
+        }
+
+        // library thumbnails
+        fill(200); textSize(11); textAlign(LEFT, CENTER);
+        text("Library (click to select for placing)", px + 24, gy0 + gs * ps + 78);
+        levelBuilder._decoLibBtns = [];
+        const lib = levelBuilder.decoLibrary || [];
+        for (let i = 0; i < Math.min(lib.length, 10); i++) {
+            const bx = px + 20 + i * 48, by = gy0 + gs * ps + 90;
+            const on = levelBuilder.decoLibIdx === i;
+            fill(on ? color(80, 50, 120) : color(40));
+            stroke(on ? color(255, 220, 80) : 80); strokeWeight(on ? 2 : 1);
+            rect(bx, by, 44, 44, 4); noStroke();
+            if (lib[i] && lib[i].grid) lbDecoDrawGridPixels(lib[i].grid, bx + 2, by + 2, 40, 40);
+            levelBuilder._decoLibBtns.push({ x: bx, y: by, w: 44, h: 44, idx: i });
+        }
+
+        // buttons
+        const by = py + ph - 50;
+        fill(0, 180, 100); rect(px + 20, by, 100, 32, 6);
+        fill(180, 60, 60); rect(px + 130, by, 100, 32, 6);
+        fill(255, 170, 60); rect(px + pw - 120, by, 100, 32, 6);
+        fill(255); textSize(12); textAlign(CENTER, CENTER);
+        text("SAVE", px + 70, by + 16);
+        text("CLEAR", px + 180, by + 16);
+        text("CLOSE", px + pw - 70, by + 16);
+        levelBuilder._decoSaveBtn = { x: px + 20, y: by, w: 100, h: 32 };
+        levelBuilder._decoClearBtn = { x: px + 130, y: by, w: 100, h: 32 };
+        levelBuilder._decoCloseBtn = { x: px + pw - 120, y: by, w: 100, h: 32 };
+        levelBuilder._decoPanel = { x: px, y: py, w: pw, h: ph };
+    }
 }
 
 function builderSnapshot() {
@@ -1674,6 +2200,10 @@ function builderSnapshot() {
         name: levelBuilder.name, portalTarget: levelBuilder.portalTarget,
         portalTargetIdx: levelBuilder.portalTargetIdx, slopeMode: levelBuilder.slopeMode,
         scrollC: levelBuilder.scrollC || 0,
+        decoCells: JSON.parse(JSON.stringify(levelBuilder.decoCells || {})),
+        decoStrokes: JSON.parse(JSON.stringify(levelBuilder.decoStrokes || [])),
+        decoPlacements: JSON.parse(JSON.stringify(levelBuilder.decoPlacements || {})),
+        decoLibrary: JSON.parse(JSON.stringify(levelBuilder.decoLibrary || [])),
         mode: levelBuilder.mode || "classic"
     };
 }
@@ -1687,6 +2217,10 @@ function builderRestoreSnapshot(snap) {
     levelBuilder.portalTargetIdx = snap.portalTargetIdx || 0;
     levelBuilder.slopeMode = snap.slopeMode == null ? 1 : snap.slopeMode;
     levelBuilder.scrollC = snap.scrollC || 0;
+    if (snap.decoCells) levelBuilder.decoCells = JSON.parse(JSON.stringify(snap.decoCells));
+    if (snap.decoStrokes) levelBuilder.decoStrokes = JSON.parse(JSON.stringify(snap.decoStrokes));
+    if (snap.decoPlacements) levelBuilder.decoPlacements = JSON.parse(JSON.stringify(snap.decoPlacements));
+    if (snap.decoLibrary) levelBuilder.decoLibrary = JSON.parse(JSON.stringify(snap.decoLibrary));
     if (snap.mode) levelBuilder.mode = snap.mode;
 }
 function builderPushUndo() {
@@ -1719,10 +2253,70 @@ function builderPaintCellAt(mx, my, dragMode) {
     const tools = builderCurrentTools(), next = levelBuilder.tool + 1, tname = tools[levelBuilder.tool];
     const key = r + "," + c;
     levelBuilder.selectedCell = key;
-    if (dragMode && levelBuilder.dragPaintLast === key) return true;
+    const _tchk = (builderCurrentTools()[levelBuilder.tool]) || "";
+    if (dragMode && levelBuilder.dragPaintLast === key && _tchk !== "deco") return true;
     const old = levelBuilder.grid[r][c] || 0;
-    if (dragMode && old === next) { levelBuilder.dragPaintLast = key; return true; }
+    // ERASE tool: clear any object in cell (no need to match type)
+    if (tname === "erase") {
+        const hasDeco = (levelBuilder.decoPlacements && levelBuilder.decoPlacements[key])
+            || (levelBuilder.decoCells && levelBuilder.decoCells[key]);
+        if (!old && !hasDeco) {
+            // still try stroke erase near cell
+            if (!dragMode) builderPushUndo();
+            const got = typeof lbDecoEraseAt === "function" && lbDecoEraseAt(r, c);
+            levelBuilder.dragPaintLast = key;
+            if (got) levelBuilder.msg = "Erased deco";
+            return true;
+        }
+        builderPushUndo();
+        levelBuilder.grid[r][c] = 0;
+        if (levelBuilder.cellMeta) delete levelBuilder.cellMeta[key];
+        if (typeof lbDecoEraseAt === "function") lbDecoEraseAt(r, c);
+        levelBuilder.dragPaintLast = key;
+        levelBuilder.msg = "Erased";
+        return true;
+    }
+    if (dragMode && old === next && tname !== "deco") { levelBuilder.dragPaintLast = key; return true; }
     if (!dragMode && tname === "secretCoin" && old !== next && builderCountSecretCoins() >= 3) { levelBuilder.msg = "Max 3 secret coins"; return true; }
+    // DECO: place pixel-art on top of anything (covers blocks)
+    if (tname === "deco") {
+        if (dragMode && levelBuilder.dragPaintLast === key) return true;
+        let grid = typeof lbDecoGetPlaceGrid === "function" ? lbDecoGetPlaceGrid() : null;
+        if (!grid) grid = levelBuilder.decoDraft;
+        if (!grid) {
+            levelBuilder.msg = "Press EDIT, paint pixels, SAVE, then place";
+            return true;
+        }
+        let has = false;
+        for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) if (grid[i] && grid[i][j]) has = true;
+        if (!has) { levelBuilder.msg = "Empty deco — EDIT → paint → SAVE"; return true; }
+        // keep library in sync so SAVE level keeps sprites
+        if (!levelBuilder.decoLibrary) levelBuilder.decoLibrary = [];
+        if (!levelBuilder.decoLibrary.length) {
+            levelBuilder.decoLibrary.push({ name: "Deco 1", grid: JSON.parse(JSON.stringify(grid)) });
+            levelBuilder.decoLibIdx = 0;
+        }
+        if (!dragMode) builderPushUndo();
+        if (!levelBuilder.decoPlacements) levelBuilder.decoPlacements = {};
+        const under = old ? (tools[old - 1] || "") : "";
+        const shape = lbDecoShapeOf(under);
+        const umeta = (levelBuilder.cellMeta && levelBuilder.cellMeta[key]) || {};
+        levelBuilder.decoPlacements[key] = {
+            libIdx: levelBuilder.decoLibIdx || 0,
+            grid: JSON.parse(JSON.stringify(grid)),
+            shape: shape,
+            shapeName: under || "",
+            scale: Number(umeta.scale) || 1,
+            rot: Number(umeta.rot) || 0,
+            ox: Number(umeta.ox) || 0,
+            oy: Number(umeta.oy) || 0,
+            r: r,
+            c: c
+        };
+        levelBuilder.dragPaintLast = key;
+        levelBuilder.msg = "Deco on " + (under || "empty") + " (" + shape + ")";
+        return true;
+    }
     builderPushUndo();
     if (!dragMode && old === next) {
         levelBuilder.grid[r][c] = 0; delete levelBuilder.cellMeta[key];
@@ -1739,6 +2333,14 @@ function builderPaintCellAt(mx, my, dragMode) {
 }
 
 function builderResizeSelected(delta) {
+    // With DECO tool: S+/S- change brush thickness
+    const toolsDeco = typeof builderCurrentTools === "function" ? builderCurrentTools() : [];
+    if (toolsDeco[levelBuilder.tool] === "deco") {
+        const cur = levelBuilder.decoSize || 0.35;
+        levelBuilder.decoSize = constrain(cur + (delta > 0 ? 0.1 : -0.1), 0.12, 1.2);
+        levelBuilder.msg = "Deco brush " + levelBuilder.decoSize.toFixed(2);
+        return;
+    }
     const keys = typeof builderGetSelectionKeys === "function" ? builderGetSelectionKeys() : [];
     const list = keys.length ? keys : (levelBuilder.selectedCell ? [levelBuilder.selectedCell] : []);
     if (!list.length) { levelBuilder.msg = "Select object(s) first"; return; }
@@ -2175,6 +2777,12 @@ function builderSaveLevel(asNew) {
         rows: levelBuilder.rows,
         portalTarget: levelBuilder.portalTarget,
         cellMeta: JSON.parse(JSON.stringify(levelBuilder.cellMeta || {})),
+        musicUrl: levelBuilder.musicUrl || "",
+        decoCells: JSON.parse(JSON.stringify(levelBuilder.decoCells || {})),
+        decoStrokes: JSON.parse(JSON.stringify(levelBuilder.decoStrokes || [])),
+        decoLibrary: JSON.parse(JSON.stringify(levelBuilder.decoLibrary || [])),
+        decoPlacements: JSON.parse(JSON.stringify(levelBuilder.decoPlacements || {})),
+        decoDraft: levelBuilder.decoDraft ? JSON.parse(JSON.stringify(levelBuilder.decoDraft)) : null,
         created: Date.now()
     };
     if (!asNew && levelBuilder.saveIdx >= 0 && levelBuilder.saveIdx < levelBuilder.saved.length) {
@@ -2182,7 +2790,10 @@ function builderSaveLevel(asNew) {
         entry.created = levelBuilder.saved[levelBuilder.saveIdx].created;
         // keep name unless user renamed
         levelBuilder.saved[levelBuilder.saveIdx] = entry;
-        levelBuilder.msg = "Updated #" + (levelBuilder.saveIdx + 1) + ": " + entry.name;
+        const dn = Object.keys(entry.decoPlacements || {}).length;
+        const dl = (entry.decoLibrary || []).length;
+        levelBuilder.msg = "Updated #" + (levelBuilder.saveIdx + 1) + ": " + entry.name
+            + (dn || dl ? (" · deco " + dn + " / lib " + dl) : "");
     } else {
         // always push a NEW slot
         if (asNew && levelBuilder.saved.some(s => s.name === entry.name)) {
@@ -2191,7 +2802,10 @@ function builderSaveLevel(asNew) {
         levelBuilder.saved.push(entry);
         levelBuilder.saveIdx = levelBuilder.saved.length - 1;
         levelBuilder.savedPage = Math.floor(levelBuilder.saveIdx / 10);
-        levelBuilder.msg = "Saved #" + (levelBuilder.saveIdx + 1) + ": " + entry.name + " (total " + levelBuilder.saved.length + ")";
+        const dn = Object.keys(entry.decoPlacements || {}).length;
+        const dl = (entry.decoLibrary || []).length;
+        levelBuilder.msg = "Saved #" + (levelBuilder.saveIdx + 1) + ": " + entry.name + " (total " + levelBuilder.saved.length + ")"
+            + (dn || dl ? (" · deco " + dn + " / lib " + dl) : "");
     }
     try { localStorage.setItem("customSavedLevels", JSON.stringify(levelBuilder.saved)); } catch (e) {
         levelBuilder.msg = "Save failed (storage full?)";
@@ -2207,6 +2821,7 @@ function builderLoadLevel(idx) {
     levelBuilder.rows = s.rows || 14;
     levelBuilder.portalTarget = s.portalTarget || "ship";
     levelBuilder.portalTargetIdx = Math.max(0, LB_PORTAL_TARGETS.indexOf(levelBuilder.portalTarget));
+    levelBuilder.musicUrl = s.musicUrl || "";
     builderGridInit();
     levelBuilder.saveIdx = idx;
     levelBuilder.savedPage = Math.floor(idx / 10);
@@ -2216,7 +2831,13 @@ function builderLoadLevel(idx) {
         }
     }
     levelBuilder.cellMeta = s.cellMeta ? JSON.parse(JSON.stringify(s.cellMeta)) : {};
-    levelBuilder.msg = "Loaded #" + (idx + 1) + ": " + levelBuilder.name + " [" + levelBuilder.mode.toUpperCase() + "]";
+    levelBuilder.decoCells = s.decoCells ? JSON.parse(JSON.stringify(s.decoCells)) : {};
+    levelBuilder.decoStrokes = s.decoStrokes ? JSON.parse(JSON.stringify(s.decoStrokes)) : [];
+    levelBuilder.decoLibrary = s.decoLibrary ? JSON.parse(JSON.stringify(s.decoLibrary)) : [];
+    levelBuilder.decoPlacements = s.decoPlacements ? JSON.parse(JSON.stringify(s.decoPlacements)) : {};
+    levelBuilder.decoDraft = s.decoDraft ? JSON.parse(JSON.stringify(s.decoDraft)) : null;
+    levelBuilder.msg = "Loaded #" + (idx + 1) + ": " + levelBuilder.name + " [" + levelBuilder.mode.toUpperCase() + "]"
+        + (levelBuilder.decoPlacements && Object.keys(levelBuilder.decoPlacements).length ? (" · deco " + Object.keys(levelBuilder.decoPlacements).length) : "");
 }
 function builderDeleteLevel() {
     if (levelBuilder.saveIdx < 0 || levelBuilder.saveIdx >= levelBuilder.saved.length) {
@@ -2267,9 +2888,10 @@ function lbEffectFromRot(baseFacing, rot) {
     return { facing: bf, axis: "y" };
 }
 
-function startBuilderTest() {
+function startBuilderTest(fromCol) {
     // Platformer = same level + same physics as classic, only movement differs (arrows vs auto-scroll)
     gdPlatformerMode = (levelBuilder.mode === "platformer");
+    lbPlayLevelMusic();
     const tools = levelBuilderToolsGD;
     gdVehicle = "cube";
     gdGroundY = sirina - 80;
@@ -2321,7 +2943,11 @@ function startBuilderTest() {
             const yTop = g - (r + 1) * blockH - (Number(meta.oy) || 0) * blockH;
             const firstObstacleIndex = gdObstacles.length;
 
-            if (tname === "spike") {
+            if (tname === "erase") {
+                // editor-only
+            } else if (tname === "deco") {
+                gdObstacles.push({ type: "deco", x: x + 2, y: yTop + 2, w: LB_CELL_W - 4, h: blockH - 4 });
+            } else if (tname === "spike") {
                 gdObstacles.push({ type: "spike", x: x + (LB_CELL_W - 20) / 2, y: yTop + blockH - 20, w: 20, h: 20 });
             } else if (tname === "spikeDown") {
                 gdObstacles.push({ type: "spikeDown", x: x + (LB_CELL_W - 20) / 2, y: yTop, w: 20, h: 20 });
@@ -2559,7 +3185,9 @@ function startBuilderTest() {
             }
         }
     }
-    // Merge vertically adjacent objects in the same column:
+    // Decoration from overlay layer (never collide)
+        // (decoPixel attached after merges)
+// Merge vertically adjacent objects in the same column:
     // portals (same target), gravity, dual, size, endDual, and blocks.
     {
         function mergeVertical(type, sameKeyFn, buildFn) {
@@ -2690,6 +3318,90 @@ function startBuilderTest() {
             delete o._center;
         }
     }
+    // Precise deco: snap to host obstacle after scale + slope merges
+    if (levelBuilder.decoPlacements) {
+        const blockH = (g - gdCeilY) / levelBuilder.rows;
+        for (const key of Object.keys(levelBuilder.decoPlacements)) {
+            const pl = levelBuilder.decoPlacements[key];
+            if (!pl || !pl.grid) continue;
+            const parts = key.split(",").map(Number);
+            const r = parts[0], c = parts[1];
+            if (isNaN(r) || isNaN(c)) continue;
+            const meta = (levelBuilder.cellMeta && levelBuilder.cellMeta[key]) || {};
+            const ox = (pl.ox != null ? pl.ox : Number(meta.ox)) || 0;
+            const oy = (pl.oy != null ? pl.oy : Number(meta.oy)) || 0;
+            const cellX = LB_START_X + c * LB_CELL_W + ox * LB_CELL_W;
+            const cellY = g - (r + 1) * blockH - oy * blockH;
+            const cx = cellX + LB_CELL_W * 0.5;
+            const cy = cellY + blockH * 0.5;
+            // Find host solid / portal / slope covering this cell center
+            let host = null;
+            let hostScore = 1e18;
+            for (let oi = 0; oi < gdObstacles.length; oi++) {
+                const o = gdObstacles[oi];
+                if (!o || o.type === "decoPixel" || o.type === "deco" || o.type === "decoStroke" || o.type === "goal") continue;
+                if (o.type === "slope") {
+                    // long merged slopes: any x overlap with cell + y band
+                    if (cx < o.x - 2 || cx > o.x + o.w + 2) continue;
+                    if (cy < o.y - 4 || cy > o.y + o.h + 4) continue;
+                    const dist = Math.abs(cx - (o.x + o.w * 0.5));
+                    if (dist < hostScore) { host = o; hostScore = dist; }
+                    continue;
+                }
+                if (o.w == null || o.h == null) continue;
+                if (cx >= o.x - 2 && cx <= o.x + o.w + 2 && cy >= o.y - 2 && cy <= o.y + o.h + 2) {
+                    const dist = Math.abs(cx - (o.x + o.w * 0.5)) + Math.abs(cy - (o.y + o.h * 0.5));
+                    if (dist < hostScore) { host = o; hostScore = dist; }
+                }
+            }
+            let dx, dy, dw, dh, shape;
+            if (host) {
+                if (host.type === "slope") {
+                    // Only this cell's column of the merged slope — exact surface band
+                    dx = cellX;
+                    dw = LB_CELL_W - 4;
+                    dy = host.y;
+                    dh = host.h;
+                    shape = (host.dir || 1) >= 0 ? "slope" : "slopeFlip";
+                } else if (host.type === "portal" || host.type === "gravityPortal"
+                    || host.type === "portalDual" || host.type === "sizePortal" || host.type === "endDual") {
+                    // Full scaled portal box
+                    dx = host.x; dy = host.y; dw = host.w; dh = host.h;
+                    shape = "portal";
+                } else if (host.type === "spike") {
+                    dx = host.x; dy = host.y; dw = host.w; dh = host.h;
+                    shape = "spikeUp";
+                } else if (host.type === "spikeDown") {
+                    dx = host.x; dy = host.y; dw = host.w; dh = host.h;
+                    shape = "spikeDown";
+                } else if (host.type === "block" || host.type === "wall" || host.type === "plat") {
+                    dx = host.x; dy = host.y; dw = host.w; dh = host.h;
+                    shape = "block";
+                } else if (String(host.type).indexOf("orb") >= 0 || host.type === "sawblade" || host.type === "secretCoin") {
+                    dx = host.x; dy = host.y; dw = host.w; dh = host.h;
+                    shape = "circle";
+                } else if (String(host.type).indexOf("pad") >= 0) {
+                    dx = host.x; dy = host.y; dw = host.w; dh = host.h;
+                    shape = "pad";
+                } else {
+                    dx = host.x; dy = host.y; dw = host.w; dh = host.h;
+                    shape = pl.shape || "rect";
+                }
+            } else {
+                dx = cellX; dy = cellY; dw = LB_CELL_W; dh = blockH;
+                shape = pl.shape || "rect";
+            }
+            gdObstacles.push({
+                type: "decoPixel",
+                x: dx, y: dy, w: dw, h: dh,
+                grid: pl.grid,
+                shape: shape,
+                shapeName: pl.shapeName || "",
+                hostType: host ? host.type : ""
+            });
+        }
+    }
+
     if (!hasEnd) {
         const endX = LB_START_X + levelBuilder.cols * LB_CELL_W + 80;
         gdObstacles.push({ type: "goal", x: endX, y: gdCeilY, w: 10, h: g - gdCeilY });
@@ -2702,6 +3414,13 @@ function startBuilderTest() {
             gdCube.y = constrain(levelBuilder._startWorldY, gdCeilY, gdGroundY - gdCube.h);
         }
         gdCube.onGround = true;
+    }
+    // Play from column (0 is valid)
+    if (fromCol != null && fromCol !== undefined && fromCol >= 0) {
+        const wx = LB_START_X + Number(fromCol) * LB_CELL_W;
+        gdScroll = max(0, wx - 100);
+        if (gdCube) { gdCube.onGround = true; gdCube.vy = 0; gdCube.x = 100; }
+        levelBuilder.msg = "Play from col " + fromCol;
     }
 
     gameMode = "GD Builder Test";
@@ -2863,6 +3582,37 @@ function tryStartMusic() {
         if (!ambientActive) startAmbientForBg(trenutnoOzadje || "Magenta");
     }
 }
+
+// ===== LEVEL BUILDER CUSTOM MUSIC =====
+let lbMusicAudio = null;
+function lbStopLevelMusic() {
+    try {
+        if (lbMusicAudio) { lbMusicAudio.pause(); lbMusicAudio.src = ""; lbMusicAudio = null; }
+    } catch (e) {}
+}
+function lbPlayLevelMusic() {
+    lbStopLevelMusic();
+    const url = (levelBuilder && levelBuilder.musicUrl) ? String(levelBuilder.musicUrl).trim() : "";
+    if (!url) return;
+    try {
+        lbMusicAudio = new Audio(url);
+        lbMusicAudio.loop = true;
+        lbMusicAudio.volume = 0.55;
+        const p = lbMusicAudio.play();
+        if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+}
+function lbPromptMusicUrl() {
+    let cur = levelBuilder.musicUrl || "";
+    let next = cur;
+    try {
+        next = window.prompt("Level music URL (mp3/ogg) — empty = none", cur);
+    } catch (e) { next = cur; }
+    if (next == null) return;
+    levelBuilder.musicUrl = String(next).trim();
+    levelBuilder.msg = levelBuilder.musicUrl ? ("Music: " + levelBuilder.musicUrl.slice(0, 40)) : "Music cleared";
+}
+
 function unlockAudioFromGesture() {
     if (!audioCtx) return;
     if (audioCtx.state === "suspended") audioCtx.resume();
@@ -6183,6 +6933,8 @@ function updateGDAI() {
     gdAIHold = false;
     gdAIBallTap = false;
     if (!gdAIPilot || !gdCube || gameOver || gdWon) return;
+    // AI allowed only for ship & wave
+    if (gdVehicle !== "ship" && gdVehicle !== "wave") { gdAIPilot = false; gdAIHold = false; return; }
     gdStarted = true;
 
     const _savedVehicle = gdVehicle;
@@ -8742,6 +9494,7 @@ function practiceRespawn() {
 }
 
 function gdDie() {
+    if (typeof lbStopLevelMusic === "function") lbStopLevelMusic();
     gdDashing = false; gdDashTimer = 0;
     if (gameOver) return;
     // Practice: respawn at last checkpoint, no coins, no game-over screen
@@ -8846,6 +9599,7 @@ function gdDie() {
     if (random() < jumpscareChance) { jumpscare = true; jumpscareTimer = 7; playJumpscareSound(); }
 }
 function gdFinish() {
+    if (typeof lbStopLevelMusic === "function") lbStopLevelMusic();
     if (gdWon) return;
     gdWon = true;
     winScreen = true;
@@ -8922,6 +9676,27 @@ function drawGeometryDash() {
     fill(120, 90, 220); rect(0, gdGroundY, sirina, 4);
 
     for (let o of gdObstacles) {
+        if (o.type === "decoPixel") continue; // drawn in final pass (always on top)
+        if (o.type === "decoStroke") {
+            if (o.pts && o.pts.length) {
+                const col = o.color || [210, 160, 255];
+                const sw = o.size != null ? o.size : 4;
+                stroke(col[0], col[1], col[2], 230);
+                strokeWeight(sw);
+                strokeJoin(ROUND); strokeCap(ROUND);
+                noFill();
+                if (o.pts.length === 1) {
+                    noStroke(); fill(col[0], col[1], col[2], 230);
+                    ellipse(o.pts[0].x - gdScroll, o.pts[0].y, sw, sw);
+                } else {
+                    beginShape();
+                    for (const p of o.pts) vertex(p.x - gdScroll, p.y);
+                    endShape();
+                }
+                noStroke();
+            }
+            continue;
+        }
         let sx = o.x - gdScroll;
         // Visible if ANY part is on screen (long slopes/wave must not vanish when start is off-edge)
         const ow = (o.w != null) ? o.w : 40;
@@ -8954,6 +9729,20 @@ function drawGeometryDash() {
             noStroke(); fill(30); ellipse(0, 0, r * 0.45, r * 0.45);
             fill(180); ellipse(0, 0, r * 0.18, r * 0.18);
             pop();
+        } else if (o.type === "deco") {
+            fill(180, 140, 255, 120); stroke(200, 160, 255, 180); strokeWeight(1);
+            rect(sx, o.y, o.w, o.h, 4);
+            noStroke();
+            fill(255, 220, 255, 160); textSize(9); textAlign(CENTER, CENTER);
+            text("✦", sx + o.w / 2, o.y + o.h / 2);
+        } else if (o.type === "decoStroke") {
+            if (o.pts && o.pts.length > 1) {
+                stroke(210, 160, 255, 230); strokeWeight(3); noFill();
+                beginShape();
+                for (const p of o.pts) vertex(p.x - gdScroll, p.y);
+                endShape();
+                noStroke();
+            }
         } else if (o.type === "startPos") {
             // visual only
             fill(80, 255, 120, 100); stroke(40, 200, 80); strokeWeight(2);
@@ -9138,6 +9927,14 @@ function drawGeometryDash() {
             textAlign(CENTER, CENTER); textSize(11); text((o.target || "?").toUpperCase(), sx + o.w/2, o.y + o.h/2);
         }
     }
+    // Deco always on top — covers blocks/spikes/slopes fully
+    for (let o of gdObstacles) {
+        if (o.type !== "decoPixel" || !o.grid) continue;
+        const sx = o.x - gdScroll;
+        if (sx + (o.w || 40) < -40 || sx > sirina + 40) continue;
+        lbDecoDrawGridPixels(o.grid, sx, o.y, o.w, o.h, o.shape || "rect");
+    }
+
 
     if (gameMode === "GD Portal Level") {
         fill(255); textAlign(CENTER, TOP); textSize(14);
@@ -12171,6 +12968,22 @@ function doSnakeLogicStep() {
 
 
 function mouseWheel(event) {
+    // Level builder: scroll tools or level columns
+    if (menu && vPodmenijuLevelBuilder) {
+        const tools = typeof builderCurrentTools === "function" ? builderCurrentTools() : [];
+        const perRow = 8;
+        const maxTS = max(0, Math.ceil(tools.length / perRow) - 3);
+        // Over tool area → tool palette scroll; else level column scroll
+        if (mouseY > 400) {
+            if (event.delta > 0) levelBuilder.toolScroll = min(maxTS, (levelBuilder.toolScroll || 0) + 1);
+            else levelBuilder.toolScroll = max(0, (levelBuilder.toolScroll || 0) - 1);
+        } else {
+            const maxScroll = max(0, levelBuilder.cols - LB_EDITOR_VISIBLE_COLS);
+            if (event.delta > 0) levelBuilder.scrollC = min(maxScroll, (levelBuilder.scrollC || 0) + 3);
+            else levelBuilder.scrollC = max(0, (levelBuilder.scrollC || 0) - 3);
+        }
+        return false;
+    }
     if (!menu || !vPodmenijuShop) return true;
     let artikli = shopKategorija === 0 ? shopSkins :
                   shopKategorija === 1 ? shopBackgrounds :
@@ -12322,6 +13135,101 @@ function mousePressed() {
             return;
         }
         if (vPodmenijuLevelBuilder) {
+            // --- Deco pixel editor ---
+            if (levelBuilder.decoEditor) {
+                const hit = (b) => b && mouseX >= b.x && mouseX < b.x + b.w && mouseY >= b.y && mouseY < b.y + b.h;
+                if (hit(levelBuilder._decoCloseBtn)) {
+                    levelBuilder.decoEditor = false;
+                    const tools = builderCurrentTools();
+                    const di = tools.indexOf("deco");
+                    if (di >= 0) levelBuilder.tool = di;
+                    levelBuilder.msg = "DECO tool on — click grid to place sprite";
+                    return;
+                }
+                if (hit(levelBuilder._decoSaveBtn)) { lbDecoSaveDraftToLibrary(); return; }
+                if (hit(levelBuilder._decoClearBtn)) {
+                    levelBuilder.decoDraft = lbDecoEmptyGrid();
+                    levelBuilder.msg = "Draft cleared";
+                    return;
+                }
+                if (levelBuilder._decoColorBtns) {
+                    for (const b of levelBuilder._decoColorBtns) {
+                        if (hit(b)) { levelBuilder.decoPaintColor = b.colorIdx; return; }
+                    }
+                }
+                if (levelBuilder._decoLibBtns) {
+                    for (const b of levelBuilder._decoLibBtns) {
+                        if (hit(b)) {
+                            levelBuilder.decoLibIdx = b.idx;
+                            const item = levelBuilder.decoLibrary[b.idx];
+                            if (item && item.grid) levelBuilder.decoDraft = JSON.parse(JSON.stringify(item.grid));
+                            levelBuilder.msg = "Selected deco #" + (b.idx + 1);
+                            return;
+                        }
+                    }
+                }
+                // paint on pixel grid
+                const pix = levelBuilder._decoPix;
+                if (pix && mouseX >= pix.x && mouseX < pix.x + pix.w && mouseY >= pix.y && mouseY < pix.y + pix.h) {
+                    const draft = lbDecoEnsureDraft();
+                    const i = floor((mouseX - pix.x) / pix.ps);
+                    const j = floor((mouseY - pix.y) / pix.ps);
+                    if (i >= 0 && i < pix.gs && j >= 0 && j < pix.gs) {
+                        if (mouseButton === RIGHT) draft[i][j] = 0;
+                        else draft[i][j] = levelBuilder.decoPaintColor || 1;
+                    }
+                    return;
+                }
+                return;
+            }
+            // MUSIC / FROM / DECO status buttons
+            {
+                const hit = (b) => b && mouseX >= b.x && mouseX < b.x + b.w && mouseY >= b.y && mouseY < b.y + b.h;
+                if (hit(levelBuilder._musicBtn)) { if (typeof lbPromptMusicUrl === "function") lbPromptMusicUrl(); return; }
+                if (hit(levelBuilder._fromBtn)) {
+                    let col = levelBuilder.scrollC || 0;
+                    if (levelBuilder.selectedCell) {
+                        const p = String(levelBuilder.selectedCell).split(",").map(Number);
+                        if (p.length === 2 && !isNaN(p[1])) col = p[1];
+                    }
+                    startBuilderTest(col); return;
+                }
+                // PLACE/EDIT handled via _decoBarBtns below
+            }
+            // Compact deco toolbar clicks (when deco tool active)
+            if (levelBuilder._decoBarBtns) {
+                const hit = (b) => b && mouseX >= b.x && mouseX < b.x + b.w && mouseY >= b.y && mouseY < b.y + b.h;
+                for (const b of levelBuilder._decoBarBtns) {
+                    if (!hit(b)) continue;
+                    if (b.kind === "placeTool") {
+                        const tools = builderCurrentTools();
+                        const di = tools.indexOf("deco");
+                        if (di >= 0) levelBuilder.tool = di;
+                        levelBuilder.decoEditor = false;
+                        levelBuilder.selectMode = false;
+                        levelBuilder.msg = "PLACE mode — click grid to stamp deco";
+                        return;
+                    }
+                    if (b.kind === "lib") {
+                        levelBuilder.decoLibIdx = b.idx;
+                        const item = levelBuilder.decoLibrary && levelBuilder.decoLibrary[b.idx];
+                        if (item && item.grid) levelBuilder.decoDraft = JSON.parse(JSON.stringify(item.grid));
+                        const tools = builderCurrentTools();
+                        const di = tools.indexOf("deco");
+                        if (di >= 0) levelBuilder.tool = di;
+                        levelBuilder.decoEditor = false;
+                        levelBuilder.msg = "Selected: " + ((item && item.name) || ("#" + (b.idx + 1)));
+                        return;
+                    }
+                    if (b.kind === "panel") {
+                        if (typeof lbDecoSeedLibrary === "function") lbDecoSeedLibrary();
+                        lbDecoEnsureDraft();
+                        levelBuilder.decoEditor = true;
+                        levelBuilder.msg = "Pixel editor — paint, SAVE, CLOSE";
+                        return;
+                    }
+                }
+            }
             if (mouseY >= 24 && mouseY <= 48) {
                 // Mode toggle Classic / Platformer
                 if (mouseX >= 8 && mouseX < 78) {
@@ -12415,25 +13323,58 @@ function mousePressed() {
                 builderPaintCellAt(mouseX, mouseY, false);
                 return;
             }
-            const toolsY = L.toolsY0;
-            const perRow = L.perRow;
-            const oldCount = L.oldCount;
-            if (mouseY >= toolsY && mouseY < toolsY + Math.ceil(oldCount / perRow) * 20) {
-                for (let i = 0; i < Math.min(oldCount, tools.length); i++) {
-                    const bx = 6 + (i % perRow) * 58;
-                    const by = toolsY + floor(i / perRow) * 20;
-                    if (mouseX >= bx && mouseX < bx + 56 && mouseY >= by && mouseY < by + 18) {
-                        levelBuilder.tool = i; return;
-                    }
+            // Level scrollbar click/drag start
+            const sb = levelBuilder._scrollBar;
+            if (sb && mouseY >= sb.y && mouseY <= sb.y + sb.h && mouseX >= sb.x && mouseX <= sb.x + sb.w) {
+                levelBuilder.draggingScroll = true;
+                const maxScroll = max(0, levelBuilder.cols - LB_EDITOR_VISIBLE_COLS);
+                const rel = constrain((mouseX - sb.x) / sb.w, 0, 1);
+                levelBuilder.scrollC = floor(rel * maxScroll);
+                return;
+            }
+
+            // Pinned ERASE / DECO
+            if (levelBuilder._pinErase) {
+                const b = levelBuilder._pinErase;
+                if (mouseX >= b.x && mouseX < b.x + b.w && mouseY >= b.y && mouseY < b.y + b.h) {
+                    levelBuilder.tool = b.idx; levelBuilder.msg = "ERASE"; return;
                 }
             }
-            {
-                const sideX = L.sideX, sideY0 = L.sideY0, sideGap = L.sideGap;
-                for (let i = oldCount; i < tools.length; i++) {
-                    const si = i - oldCount;
-                    const by = sideY0 + si * sideGap;
-                    if (mouseX >= sideX && mouseX < sideX + 110 && mouseY >= by && mouseY < by + 18) {
-                        levelBuilder.tool = i; return;
+            if (levelBuilder._pinDeco) {
+                const b = levelBuilder._pinDeco;
+                if (mouseX >= b.x && mouseX < b.x + b.w && mouseY >= b.y && mouseY < b.y + b.h) {
+                    levelBuilder.tool = b.idx;
+                    levelBuilder.selectMode = false;
+                    levelBuilder.decoEditor = false;
+                    if (typeof lbDecoSeedLibrary === "function") lbDecoSeedLibrary();
+                    levelBuilder.msg = "DECO — click grid to place";
+                    return;
+                }
+            }
+            const toolsY = L.toolsY0;
+            const perRow = L.perRow;
+            const toolRowsVisible = L.toolRowsVisible || 3;
+            const tScroll = levelBuilder.toolScroll || 0;
+            const arrowX = 6 + perRow * 54 + 2;
+            if (mouseX >= arrowX && mouseX < arrowX + 18) {
+                if (mouseY >= toolsY && mouseY < toolsY + 16) {
+                    levelBuilder.toolScroll = max(0, tScroll - 1); return;
+                }
+                if (mouseY >= toolsY + 36 && mouseY < toolsY + 52) {
+                    const maxTS = max(0, Math.ceil(tools.length / perRow) - toolRowsVisible);
+                    levelBuilder.toolScroll = min(maxTS, tScroll + 1); return;
+                }
+            }
+            if (mouseY >= toolsY && mouseY < toolsY + toolRowsVisible * 18) {
+                for (let row = 0; row < toolRowsVisible; row++) {
+                    for (let col = 0; col < perRow; col++) {
+                        const i = (row + tScroll) * perRow + col;
+                        if (i >= tools.length) continue;
+                        const bx = 6 + col * 54;
+                        const by = toolsY + row * 18;
+                        if (mouseX >= bx && mouseX < bx + 52 && mouseY >= by && mouseY < by + 16) {
+                            levelBuilder.tool = i; return;
+                        }
                     }
                 }
             }
@@ -12443,7 +13384,7 @@ function mousePressed() {
                 if (mouseX >= 54 && mouseX < 98) { builderSaveLevel(true); return; }
                 if (mouseX >= 100 && mouseX < 144) { builderSaveLevel(false); return; }
                 if (mouseX >= 146 && mouseX < 186) { builderDeleteLevel(); return; }
-                if (mouseX >= 188 && mouseX < 228) { builderPushUndo(); for (let rr=0; rr<levelBuilder.rows; rr++) for (let cc=0; cc<levelBuilder.cols; cc++) levelBuilder.grid[rr][cc]=0; levelBuilder.cellMeta={}; levelBuilder.selectedCell=null; levelBuilder.selectedCells=[]; levelBuilder.msg = "Cleared"; return; }
+                if (mouseX >= 188 && mouseX < 228) { builderPushUndo(); for (let rr=0; rr<levelBuilder.rows; rr++) for (let cc=0; cc<levelBuilder.cols; cc++) levelBuilder.grid[rr][cc]=0; levelBuilder.cellMeta={}; levelBuilder.decoCells={}; levelBuilder.decoStrokes=[]; levelBuilder.decoPlacements={}; levelBuilder.selectedCell=null; levelBuilder.selectedCells=[]; levelBuilder.msg = "Cleared"; return; }
                 if (mouseX >= 230 && mouseX < 270) { levelBuilder.selectMode = !levelBuilder.selectMode; if (!levelBuilder.selectMode) { levelBuilder.selectedCells = []; } levelBuilder.msg = levelBuilder.selectMode ? "SELECT: click / drag / Shift+click — no paint" : "Paint mode"; return; }
                 if (mouseX >= 272 && mouseX < 308) { builderResizeSelected(-0.25); return; }
                 if (mouseX >= 310 && mouseX < 346) { builderResizeSelected(0.25); return; }
@@ -12569,6 +13510,13 @@ function mousePressed() {
     }
 }
 
+function mouseReleased() {
+    if (levelBuilder) {
+        levelBuilder.draggingScroll = false;
+        levelBuilder.draggingToolScroll = false;
+        levelBuilder.decoDrawing = false;
+    }
+}
 function mouseDragged() {
     if (showSettings) {
         if (mouseY > 110 && mouseY < 140 && mouseX > 150 && mouseX < 450) {
@@ -12579,6 +13527,29 @@ function mouseDragged() {
     }
     if (vUredniku) paintPixel();
     if (menu && vPodmenijuLevelBuilder) {
+        // While deco pixel editor is open: only paint pixels, never the level
+        if (levelBuilder.decoEditor) {
+            const pix = levelBuilder._decoPix;
+            if (pix && mouseX >= pix.x && mouseX < pix.x + pix.w && mouseY >= pix.y && mouseY < pix.y + pix.h) {
+                const draft = lbDecoEnsureDraft();
+                const i = floor((mouseX - pix.x) / pix.ps);
+                const j = floor((mouseY - pix.y) / pix.ps);
+                if (i >= 0 && i < pix.gs && j >= 0 && j < pix.gs) {
+                    if (mouseButton === RIGHT) draft[i][j] = 0;
+                    else draft[i][j] = levelBuilder.decoPaintColor || 1;
+                }
+            }
+            return;
+        }
+        if (levelBuilder.draggingScroll) {
+            const sb = levelBuilder._scrollBar;
+            if (sb) {
+                const maxScroll = max(0, levelBuilder.cols - LB_EDITOR_VISIBLE_COLS);
+                const rel = constrain((mouseX - sb.x) / max(1, sb.w), 0, 1);
+                levelBuilder.scrollC = floor(rel * maxScroll);
+            }
+            return;
+        }
         if (levelBuilder.selectMode) {
             // drag-select: add cells under cursor (no paint)
             const L = typeof builderLayout === "function" ? builderLayout() : null;
@@ -13366,10 +14337,13 @@ function premakniHrano() {
 }
 
 function keyPressed() {
-    // I = AI pilot (Wave, Ship, and other GD modes still supported)
-    if ((gameMode === "Tower Climb" || gameMode === "Geometry Dash" || gameMode === "GD Ship" || gameMode === "GD Wave" || gameMode.startsWith("GD ")) && (key === "i" || key === "I")) {
-        if (gameMode === "Tower Climb") tower.ai = !tower.ai;
-        else gdAIPilot = !gdAIPilot;
+    // I = AI pilot ONLY on ship / wave
+    if (key === "i" || key === "I") {
+        if (gameMode === "Tower Climb") { tower.ai = !tower.ai; return; }
+        const v = (typeof gdVehicle === "string") ? gdVehicle : "";
+        if (v === "ship" || v === "wave" || gameMode === "GD Ship" || gameMode === "GD Wave") {
+            gdAIPilot = !gdAIPilot;
+        }
         return;
     }
     unlockAudioFromGesture();
