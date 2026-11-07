@@ -3,6 +3,7 @@
 
 
 
+
 const velikost = 20;
 const sirina = 600;
 
@@ -371,6 +372,8 @@ let levelBuilder = {
     name: "My Level",
     saved: [],
     saveIdx: -1,
+    inEditor: false, // false = level list browser, true = editing a level
+    browserSel: 0,
     msg: "",
     portalTarget: "ship", // selected vehicle for NEXT portal placement
     portalTargetIdx: 1,
@@ -396,7 +399,9 @@ let levelBuilder = {
     decoPaintColor: 1,
 
     undoStack: [], redoStack: [], historyLimit: 80, dragPaintLast: "", selectedCell: null, selectedCells: [], selectMode: false, savedPage: 0,
-    showHitboxes: false
+    showHitboxes: false,
+    showHitboxTrail: false,
+    hitboxTrail: []
 };
 
 // ===== PLATFORMER GD STATE =====
@@ -449,7 +454,7 @@ const levelBuilderToolsGD = [
     // NEW append-only (do not reorder above)
     "startPos", "checkpoint",
     // Editor utilities (append only)
-    "erase", "deco"
+    "erase", "deco", "decoErase"
 ];
 const levelBuilderTools = levelBuilderToolsGD;
 const LB_PORTAL_TARGETS = ["cube", "ship", "wave", "ufo", "ball", "robot", "swing", "spider", "dart", "mini"];
@@ -458,7 +463,17 @@ const LB_OLD_TOOL_COUNT = 16; // bottom row buttons; new tools use right side pa
 const LB_CELL_W = 48;
 const LB_CELL_H = 34;
 const LB_START_X = 280;
-const LB_EDITOR_VISIBLE_COLS = 28;
+const LB_EDITOR_VISIBLE_COLS = 28; // legacy fallback; prefer lbVisibleCols()
+function lbVisibleCols() {
+    try {
+        if (typeof builderLayout === "function") {
+            const v = builderLayout().visCols;
+            if (v) return v;
+        }
+    } catch (e) {}
+    return LB_EDITOR_VISIBLE_COLS;
+}
+
 
 
 
@@ -552,6 +567,7 @@ let audioCtx = null;
 let practiceMode = false;
 try { practiceMode = localStorage.getItem("practiceMode") === "1"; } catch (e) { practiceMode = false; }
 let multiActivateOrbs = false;
+let gdOrbHoldConsumed = false; // one orb activation per press/hold; reset only after release
 let builderShiftHeld = false;
 try { multiActivateOrbs = localStorage.getItem("multiActivateOrbs") === "1"; } catch (e) { multiActivateOrbs = false; }
 let practiceCheckpoints = []; // {scroll,x,y,vehicle,vehicle2,dual,gDir,gDir2,size,size2,auto}
@@ -834,6 +850,9 @@ function setup() {
         const ls = localStorage.getItem("customSavedLevels");
         if (ls) levelBuilder.saved = JSON.parse(ls);
         if (!Array.isArray(levelBuilder.saved)) levelBuilder.saved = [];
+        // Remove failed demo level if present
+        levelBuilder.saved = levelBuilder.saved.filter(s => s && s.id !== "level-twin-pulse" && s.name !== "Twin Pulse");
+        try { localStorage.setItem("customSavedLevels", JSON.stringify(levelBuilder.saved)); } catch (e2) {}
     } catch (e) { levelBuilder.saved = []; }
 
     try { syncAchievementRewards(); } catch (e) {}
@@ -1561,12 +1580,9 @@ function lbDecoDrawGridPixels(grid, x, y, cellW, cellH, shape) {
     shape = shape || "rect";
     const n = typeof DECO_GRID_SIZE === "number" ? DECO_GRID_SIZE : 8;
     const pw = cellW / n, ph = cellH / n;
-    // 1) solid cover in exact object shape (black for slopes, dark for rest)
-    const under = (shape === "slope" || shape === "slopeFlip")
-        ? [0, 0, 0, 255]
-        : [10, 10, 18, 255];
-    lbDecoFillShape(shape, x, y, cellW, cellH, under);
-    // 2) paint pixels only inside shape
+    // Deco is a transparent texture overlay: preserve the original object's
+    // appearance and collision geometry underneath it.
+    // Paint only non-empty pixels inside the object's shape.
     noStroke();
     for (let i = 0; i < n; i++) {
         for (let j = 0; j < n; j++) {
@@ -1625,28 +1641,178 @@ function lbDecoStampPreset(name, cellX, cellY, scale) {
 }
 
 
+
+// ===== WYSIWYG LEVEL BUILDER (same scale & look as real GD play) =====
+function builderWorldMetrics() {
+    const g = sirina - 80;
+    const builderWorldCellH = Math.max(20, (g - 40) / 18);
+    const ceilY = Math.max(32, g - levelBuilder.rows * builderWorldCellH);
+    const blockH = (g - ceilY) / Math.max(1, levelBuilder.rows);
+    return { g, ceilY, blockH, cellW: LB_CELL_W, startX: LB_START_X };
+}
+
+function builderVisibleCols() {
+    // How many world columns fit in the playfield viewport (full width minus thin side pad)
+    const L = builderLayout();
+    return Math.max(4, Math.floor(L.viewW / LB_CELL_W));
+}
+
+function builderEditorScrollX() {
+    const m = builderWorldMetrics();
+    const scrollC = levelBuilder.scrollC || 0;
+    // Align left of viewport with column scrollC (same world coords as play)
+    return m.startX + scrollC * m.cellW - 8;
+}
+
 function builderLayout() {
-    const gx = 12, gy = 58, cw = 16;
-    // Bottom stack: scrollbar(12) + tools(3*18=54) + gap + btns(22) + saved(40) + pad
-    const bottomReserve = 12 + 54 + 6 + 22 + 40 + 8;
-    const gridMaxH = Math.max(80, sirina - gy - bottomReserve);
-    const ch = constrain(Math.floor(gridMaxH / Math.max(1, levelBuilder.rows)), 10, 16);
-    const gridH = levelBuilder.rows * ch;
-    const barY = gy + gridH + 2;
-    const toolsY0 = barY + 14; // below scrollbar
+    // Top toolbar; bottom stack is built from the bottom up so tools never overlap buttons.
+    const topUI = 64;
     const perRow = 8;
-    const toolRowsVisible = 3;
-    const btnY = Math.min(toolsY0 + toolRowsVisible * 18 + 4, sirina - 68);
-    // MUSIC / FROM in top bar (never over grid or action buttons)
+    const toolRowsVisible = 2; // 2 rows of tools + scroll arrows
+    const toolRowH = 17;
+    const toolsH = toolRowsVisible * toolRowH;
+    const btnH = 22;
+    const barH = 10;
+    // order from bottom: buttons → tools → scrollbar → playfield
+    const bottomPad = 4;
+    const bottomUI = bottomPad + btnH + 4 + toolsH + 4 + barH + 4;
+    const gx = 0;
+    const gy = topUI;
+    const m = (typeof builderWorldMetrics === 'function') ? builderWorldMetrics() : { cellW: LB_CELL_W, blockH: 34, g: sirina - 80, ceilY: 40 };
+    const cw = m.cellW;
+    const ch = m.blockH;
+    const viewH = Math.max(80, sirina - topUI - bottomUI);
+    const viewW = sirina;
+    const visCols = Math.max(4, Math.floor(viewW / cw));
+    const btnY = sirina - bottomPad - btnH;
+    const toolsY0 = btnY - 4 - toolsH;
+    const barY = toolsY0 - 4 - barH;
     const sideX = 400, sideY0 = 26;
-    return { gx, gy, cw, ch, toolsY0, perRow, btnY, barY, sideX, sideY0, toolRowsVisible };
+    return {
+        gx, gy, cw, ch, toolsY0, perRow, btnY, barY, sideX, sideY0, toolRowsVisible,
+        toolRowH, toolsH, btnH, barH,
+        viewW, viewH, visCols, topUI, bottomUI,
+        groundY: m.g, ceilY: m.ceilY, startX: m.startX
+    };
+}
+
+
+function builderAutoSave() {
+    if (!levelBuilder || levelBuilder.saveIdx < 0) return false;
+    try {
+        builderSaveLevel(false);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+function builderOpenNewLevel() {
+    let n = "My Level";
+    try {
+        const p = prompt("Ime novega levela:", "My Level " + (levelBuilder.saved.length + 1));
+        if (p === null) return false; // cancelled
+        n = (p || "My Level").slice(0, 24);
+    } catch (e) {}
+    levelBuilder.name = n;
+    levelBuilder.mode = levelBuilder.mode || "classic";
+    builderGridInit();
+    levelBuilder.saveIdx = -1;
+    builderSaveLevel(true); // creates new slot and sets saveIdx
+    levelBuilder.inEditor = true;
+    levelBuilder.msg = "Nov level: " + levelBuilder.name;
+    playMenuSound();
+    return true;
+}
+
+function builderOpenLevel(idx) {
+    if (idx < 0 || idx >= (levelBuilder.saved || []).length) return false;
+    builderLoadLevel(idx);
+    levelBuilder.inEditor = true;
+    playMenuSound();
+    return true;
+}
+
+function builderBackToList() {
+    builderAutoSave();
+    levelBuilder.inEditor = false;
+    levelBuilder.msg = "";
+    playMenuSound();
+}
+
+function drawLevelBrowser() {
+    background(8, 10, 24);
+    textAlign(CENTER, CENTER);
+    fill(0, 240, 255); textSize(26);
+    text("🧩 LEVEL BUILDER", sirina / 2, 36);
+    fill(160); textSize(12);
+    text("Izberi level ali ustvari novega", sirina / 2, 62);
+
+    const list = levelBuilder.saved || [];
+    const startY = 95;
+    const rowH = 36;
+    const maxVis = 11;
+    const page = levelBuilder.savedPage || 0;
+    const pages = Math.max(1, Math.ceil(Math.max(1, list.length) / maxVis));
+    levelBuilder.savedPage = constrain(page, 0, pages - 1);
+    const from = levelBuilder.savedPage * maxVis;
+    const to = Math.min(list.length, from + maxVis);
+
+    // NEW LEVEL card
+    const newY = startY;
+    fill(255, 170, 50);
+    rect(sirina / 2 - 200, newY, 400, 40, 10);
+    fill(20); textSize(16); text("+  NOV LEVEL", sirina / 2, newY + 20);
+    levelBuilder._browserNew = { x: sirina / 2 - 200, y: newY, w: 400, h: 40 };
+
+    levelBuilder._browserRows = [];
+    if (list.length === 0) {
+        fill(120); textSize(13);
+        text("Še nimaš shranjenih levelev", sirina / 2, startY + 70);
+    } else {
+        for (let i = from; i < to; i++) {
+            const y = startY + 52 + (i - from) * rowH;
+            const on = (levelBuilder.browserSel === i);
+            fill(on ? color(0, 200, 160) : color(35, 40, 58));
+            rect(sirina / 2 - 200, y, 400, rowH - 4, 8);
+            fill(on ? 10 : 230); textSize(14); textAlign(LEFT, CENTER);
+            const lv = list[i];
+            const mode = (lv.mode === "platformer") ? "PLAT" : "CLASSIC";
+            text((i + 1) + ".  " + (lv.name || "Level"), sirina / 2 - 185, y + (rowH - 4) / 2);
+            textAlign(RIGHT, CENTER); fill(on ? 30 : 160); textSize(11);
+            text(mode + "  ·  " + (lv.cols || "?") + "×" + (lv.rows || "?"), sirina / 2 + 190, y + (rowH - 4) / 2);
+            levelBuilder._browserRows.push({ x: sirina / 2 - 200, y: y, w: 400, h: rowH - 4, idx: i });
+        }
+    }
+
+    // page controls
+    if (pages > 1) {
+        textAlign(CENTER, CENTER);
+        fill(70, 90, 130); rect(sirina / 2 - 60, sirina - 70, 40, 24, 5);
+        fill(70, 90, 130); rect(sirina / 2 + 20, sirina - 70, 40, 24, 5);
+        fill(255); textSize(14); text("<", sirina / 2 - 40, sirina - 58);
+        text(">", sirina / 2 + 40, sirina - 58);
+        fill(180); textSize(11); text((levelBuilder.savedPage + 1) + " / " + pages, sirina / 2, sirina - 58);
+        levelBuilder._browserPrev = { x: sirina / 2 - 60, y: sirina - 70, w: 40, h: 24 };
+        levelBuilder._browserNext = { x: sirina / 2 + 20, y: sirina - 70, w: 40, h: 24 };
+    } else {
+        levelBuilder._browserPrev = null;
+        levelBuilder._browserNext = null;
+    }
+
+    fill(130); textSize(11); textAlign(CENTER, CENTER);
+    text("ENTER = odpri  ·  N = nov  ·  DEL = zbriši  ·  ESC = meni", sirina / 2, sirina - 28);
 }
 
 function drawLevelBuilderMenu() {
+    if (!levelBuilder.inEditor) {
+        drawLevelBrowser();
+        return;
+    }
     background(7, 10, 20);
     textAlign(CENTER, CENTER);
     fill(0, 240, 255); textSize(18);
-    text("🧩 LEVEL BUILDER", sirina / 2, 14);
+    text("🧩 " + (levelBuilder.name || "Level"), sirina / 2, 14);
 
     // === MODE TOGGLE Classic / Platformer ===
     const isPlat = levelBuilder.mode === "platformer";
@@ -1671,8 +1837,6 @@ function drawLevelBuilderMenu() {
     fill(255); textSize(7); text("↶", 428, 35);
     fill(65, 105, 150); rect(452, 26, 40, 18, 4);
     fill(255); textSize(7); text("↷", 472, 35);
-    fill(255, 140, 40); rect(496, 26, 48, 18, 4);
-    fill(15); textSize(7); text("NEW", 520, 35);
     fill(levelBuilder.showHitboxes ? color(255, 70, 90) : color(70, 55, 80));
     rect(548, 26, 46, 18, 4);
     fill(255); textSize(7); text(levelBuilder.showHitboxes ? "HIT" : "HIT", 571, 35);
@@ -1727,278 +1891,198 @@ function drawLevelBuilderMenu() {
 
     const L = builderLayout();
     const gx = L.gx, gy = L.gy, cw = L.cw, ch = L.ch;
-    const vis = LB_EDITOR_VISIBLE_COLS;
+    const vis = L.visCols || Math.max(4, Math.floor(sirina / LB_CELL_W));
     const scrollC = constrain(levelBuilder.scrollC || 0, 0, max(0, levelBuilder.cols - vis));
     levelBuilder.scrollC = scrollC;
-    for (let r = 0; r < levelBuilder.rows; r++) {
-        for (let vi = 0; vi < vis; vi++) {
-            const c = scrollC + vi;
-            if (c >= levelBuilder.cols) break;
-            const vr = levelBuilder.rows - 1 - r;
-            stroke(40); noFill();
-            rect(gx + vi * cw, gy + vr * ch, cw, ch);
-            const cellKey = r + "," + c;
-            {
-                const sm = (levelBuilder.cellMeta && levelBuilder.cellMeta[cellKey]) || {};
-                const sox = Number(sm.ox) || 0, soy = Number(sm.oy) || 0;
-                const multiOn = levelBuilder.selectedCells && levelBuilder.selectedCells.indexOf(cellKey) >= 0;
-                if (levelBuilder.selectedCell === cellKey || multiOn) {
-                    stroke(multiOn && levelBuilder.selectedCell !== cellKey ? color(80, 220, 255) : color(255, 255, 255));
-                    strokeWeight(2); noFill();
-                    rect(gx + vi * cw + sox * cw + 1, gy + vr * ch - soy * ch + 1, cw - 2, ch - 2);
-                    strokeWeight(1);
-                }
-            }
-            const v = (levelBuilder.grid[r] && levelBuilder.grid[r][c]) || 0;
-            // If deco is on this cell, skip object graphic — deco draws the shape on top later
-            const decoHere = levelBuilder.decoPlacements && levelBuilder.decoPlacements[r + "," + c];
-            if (decoHere) continue;
-            if (!v) continue;
-            const tname = tools[v - 1] || "spike";
-            const col = toolColors[tname] || [200, 200, 200];
-            fill(col[0], col[1], col[2]); noStroke();
-            const cellMeta = (levelBuilder.cellMeta && levelBuilder.cellMeta[cellKey]) || {};
-            // Show arrow-key nudge (0.2 block) live in the grid
-            const ox = Number(cellMeta.ox) || 0;
-            const oy = Number(cellMeta.oy) || 0;
-            const px = gx + vi * cw + ox * cw;
-            // editor row: vr is top-down draw index; oy+ = up in play → move toward smaller py
-            const py = gy + vr * ch - oy * ch;
-            const cellScale = constrain(Number(cellMeta.scale) || 1, 0.5, 18);
-            const isPortalDraw = tname === "portal" || tname === "gravityUp" || tname === "gravityDown"
-                || tname === "portalDual" || tname === "sizeMini" || tname === "sizeNormal" || tname === "endDual";
-            push();
-            translate(px + cw / 2, py + ch / 2);
-            if (isPortalDraw) scale(1, cellScale);
-            else scale(cellScale);
-            translate(-(px + cw / 2), -(py + ch / 2));
-            if (tname === "erase") {
-                // never drawn on grid
-            } else if (tname === "deco") {
-                fill(200, 150, 255, 160);
-                rect(px + 2, py + 2, cw - 4, ch - 4, 3);
-                fill(255); textSize(8); text("✦", px + cw / 2, py + ch / 2);
-            } else if (tname === "spike") {
-                triangle(px + 2, py + ch - 2, px + cw / 2, py + 3, px + cw - 2, py + ch - 2);
-            } else if (tname === "spikeDown") {
-                triangle(px + 2, py + 2, px + cw / 2, py + ch - 3, px + cw - 2, py + 2);
-            } else if (tname.indexOf("portal") >= 0 || tname === "gravityUp" || tname === "gravityDown") {
-                ellipse(px + cw / 2, py + ch / 2, 12, 12);
-            } else if (tname === "orbDash") {
-                fill(40, 255, 100);
-                ellipse(px + cw / 2, py + ch / 2, 12, 12);
-                stroke(20, 180, 60); strokeWeight(1.5);
-                line(px + 4, py + ch / 2, px + cw - 3, py + ch / 2);
-                line(px + cw - 6, py + ch / 2 - 3, px + cw - 3, py + ch / 2);
-                line(px + cw - 6, py + ch / 2 + 3, px + cw - 3, py + ch / 2);
-                noStroke();
-            } else if (tname === "secretCoin" || tname === "orbYellow") {
-                ellipse(px + cw / 2, py + ch / 2, 11, 11);
-            } else if (tname === "waveSlope") {
-                const metaW = (levelBuilder.cellMeta && levelBuilder.cellMeta[r + "," + c]) || {};
-                const sd = metaW.slopeMode != null ? metaW.slopeMode : (levelBuilder.slopeMode != null ? levelBuilder.slopeMode : 1);
-                stroke(col[0], col[1], col[2]); strokeWeight(2); noFill();
-                if (sd === 0) {
-                    line(px + 1, py + ch / 2, px + cw - 1, py + ch / 2); // flat
-                } else if (sd > 0) {
-                    line(px + 1, py + ch - 3, px + cw - 1, py + 3); // ↑45°
-                } else {
-                    line(px + 1, py + 3, px + cw - 1, py + ch - 3); // ↓45°
-                }
-                noStroke();
-                fill(col[0], col[1], col[2], 90);
-                rect(px + 2, py + 4, cw - 4, ch - 8);
-            } else if (tname === "padYellowCeil" || tname === "padBlueCeil" || tname === "padPinkCeil") {
-                fill(col[0], col[1], col[2]);
-                rect(px + 1, py + 2, cw - 2, 6, 2);
-            } else if (tname === "padBlue" || tname === "padPink") {
-                fill(col[0], col[1], col[2]);
-                rect(px + 1, py + ch - 8, cw - 2, 6, 2);
-            } else if (tname === "orbBlue" || tname === "orbPink" || tname === "orbBlueTrue" || tname === "orbBlack") {
-                fill(col[0], col[1], col[2]);
-                ellipse(px + cw / 2, py + ch / 2, 11, 11);
-                if (tname === "orbPink") {
-                    noFill(); stroke(255, 160, 160); strokeWeight(1);
-                    ellipse(px + cw / 2, py + ch / 2, 14, 14); noStroke();
-                } else if (tname === "orbBlueTrue") {
-                    noFill(); stroke(180, 220, 255); strokeWeight(1);
-                    ellipse(px + cw / 2, py + ch / 2, 14, 14); noStroke();
-                } else if (tname === "orbBlack") {
-                    noFill(); stroke(180); strokeWeight(1);
-                    ellipse(px + cw / 2, py + ch / 2, 14, 14); noStroke();
-                } else if (tname === "orbBlue") {
-                    // green ring (legacy green behavior)
-                    noFill(); stroke(150, 255, 180); strokeWeight(1);
-                    ellipse(px + cw / 2, py + ch / 2, 14, 14); noStroke();
-                }
-            } else if (tname === "end" || tname === "endDual") {
-                fill(tname === "endDual" ? color(255, 100, 60) : color(80, 255, 140));
-                rect(px + 4, py + 2, 6, ch - 4);
-                fill(255, 60, 60);
-                triangle(px + 10, py + 4, px + cw - 1, py + ch / 2, px + 10, py + ch - 4);
-                if (tname === "endDual") {
-                    fill(255); textSize(5); textAlign(CENTER, CENTER);
-                    text("2", px + cw / 2 + 2, py + 5);
-                }
-            } else if (tname === "padYellow") {
-                rect(px + 1, py + ch - 8, cw - 2, 6, 2);
-            } else if (tname === "portalDual") {
-                fill(col[0], col[1], col[2]);
-                ellipse(px + cw / 2, py + ch * 0.32, 9, 9);
-                ellipse(px + cw / 2, py + ch * 0.68, 9, 9);
-                fill(255); textSize(6); textAlign(CENTER, CENTER);
-                text("2", px + cw / 2, py + ch / 2);
-            } else if (tname === "sizeMini") {
-                fill(col[0], col[1], col[2]);
-                rect(px + 4, py + 5, cw - 8, ch - 10, 2);
-                fill(255); textSize(6); textAlign(CENTER, CENTER);
-                text("S", px + cw / 2, py + ch / 2);
-            } else if (tname === "sizeNormal") {
-                fill(col[0], col[1], col[2]);
-                rect(px + 2, py + 3, cw - 4, ch - 6, 2);
-                fill(255); textSize(6); textAlign(CENTER, CENTER);
-                text("N", px + cw / 2, py + ch / 2);
-            } else if (tname === "slope" || tname === "slopeFlip") {
-                // Base triangle + cell rot (90° steps) — cell size stays the same
-                fill(col[0], col[1], col[2]);
-                const srot = ((Number(cellMeta.rot) || 0) % 360 + 360) % 360;
-                push();
-                translate(px + cw / 2, py + ch / 2);
-                if (srot) rotate(radians(srot));
-                if (tname === "slope") {
-                    // /  (bl, br, tr)
-                    triangle(-cw / 2 + 1, ch / 2 - 1, cw / 2 - 1, ch / 2 - 1, cw / 2 - 1, -ch / 2 + 1);
-                } else {
-                    // \ (tl, bl, br)
-                    triangle(-cw / 2 + 1, -ch / 2 + 1, -cw / 2 + 1, ch / 2 - 1, cw / 2 - 1, ch / 2 - 1);
-                }
-                pop();
-            } else if (tname === "sawblade") {
-                fill(220, 50, 50);
-                ellipse(px + cw / 2, py + ch / 2, cw * 0.85, ch * 0.85);
-                fill(40); ellipse(px + cw / 2, py + ch / 2, cw * 0.25, ch * 0.25);
-                stroke(255, 180, 80); strokeWeight(1);
-                for (let t = 0; t < 6; t++) {
-                    const a = t * Math.PI / 3;
-                    line(px + cw / 2 + cos(a) * cw * 0.2, py + ch / 2 + sin(a) * ch * 0.2,
-                         px + cw / 2 + cos(a) * cw * 0.42, py + ch / 2 + sin(a) * ch * 0.42);
-                }
-                noStroke();
-            } else {
-                rect(px + 2, py + 4, cw - 4, ch - 8, 2);
-            }
-            // show portal target letter on portal cells
-            if (tname === "portal") {
-                const meta = (levelBuilder.cellMeta && levelBuilder.cellMeta[r + "," + c]) || {};
-                const tgt = (meta.target || levelBuilder.portalTarget || "?").charAt(0).toUpperCase();
-                fill(255); textSize(7); textAlign(CENTER, CENTER);
-                text(tgt, px + cw / 2, py + ch / 2);
-            }
-            pop();
-            // Rot badge only — does not rotate the cell graphic
-            const showRot = ((Number(cellMeta.rot) || 0) % 360 + 360) % 360;
-            if (showRot) {
-                fill(255, 220, 80); textSize(6); textAlign(CENTER, CENTER); noStroke();
-                text(showRot + "°", px + cw / 2, py + 5);
-            }
+    levelBuilder._editorVis = vis;
+    levelBuilder._editorLayout = L;
+
+    // --- Full-scale playfield (same look as real GD, no player) ---
+    // Shift world so ground sits on the bottom of the middle band (tools don't cover it).
+    const prevObs = gdObstacles;
+    const prevScroll = gdScroll;
+    const prevG = gdGroundY;
+    const prevCeil = gdCeilY;
+    const prevCube = gdCube;
+    const prevCube2 = gdCube2;
+    const prevDual = gdDual;
+    const viewTop = L.topUI || 68;
+    const viewBot = sirina - (L.bottomUI || 128);
+    const viewH = Math.max(40, viewBot - viewTop);
+    try {
+        if (typeof builderCompileLevelObstacles === 'function') {
+            builderCompileLevelObstacles();
+        } else {
+            gdObstacles = [];
         }
-    }
-    // Deco — exact same transform as host object (scale / rot / nudge)
-    if (levelBuilder.decoPlacements) {
-        for (let r = 0; r < levelBuilder.rows; r++) {
-            for (let vi = 0; vi < vis; vi++) {
-                const c = scrollC + vi;
-                if (c >= levelBuilder.cols) break;
-                const key = r + "," + c;
-                const pl = levelBuilder.decoPlacements[key];
-                if (!pl || !pl.grid) continue;
-                const vr = levelBuilder.rows - 1 - r;
-                const meta = (levelBuilder.cellMeta && levelBuilder.cellMeta[key]) || {};
-                const ox = Number(meta.ox) || 0, oy = Number(meta.oy) || 0;
-                const px = gx + vi * cw + ox * cw;
-                const py = gy + vr * ch - oy * ch;
-                const gv = (levelBuilder.grid[r] && levelBuilder.grid[r][c]) || 0;
-                const tn = gv ? (tools[gv - 1] || "") : (pl.shapeName || "");
-                let shape = pl.shape || lbDecoShapeOf(tn);
-                if (tn === "slopeFlip") shape = "slopeFlip";
-                if (tn === "slope") shape = "slope";
-                const cellScale = constrain(Number(meta.scale) || 1, 0.5, 18);
-                const isPortal = tn === "portal" || tn === "gravityUp" || tn === "gravityDown"
-                    || tn === "portalDual" || tn === "sizeMini" || tn === "sizeNormal" || tn === "endDual";
-                const srot = ((Number(meta.rot) || 0) % 360 + 360) % 360;
-                push();
-                translate(px + cw / 2, py + ch / 2);
-                if (isPortal) scale(1, cellScale);
-                else scale(cellScale);
-                if (srot && (tn === "slope" || tn === "slopeFlip" || tn === "spike" || tn === "spikeDown")) {
-                    rotate(radians(srot));
-                }
-                translate(-(px + cw / 2), -(py + ch / 2));
-                // precise footprint per type (match editor object drawing)
-                let dx = px, dy = py, dw = cw, dh = ch;
-                if (tn === "spike") {
-                    dx = px + 2; dy = py + 3; dw = cw - 4; dh = ch - 5;
-                    shape = "spikeUp";
-                } else if (tn === "spikeDown") {
-                    dx = px + 2; dy = py + 2; dw = cw - 4; dh = ch - 5;
-                    shape = "spikeDown";
-                } else if (tn === "block") {
-                    dx = px; dy = py; dw = cw; dh = ch;
-                    shape = "block";
-                } else if (tn && tn.indexOf("orb") >= 0) {
-                    dx = px + 2; dy = py + 2; dw = cw - 4; dh = ch - 4;
-                    shape = "circle";
-                } else if (isPortal) {
-                    dx = px + 2; dy = py + 1; dw = cw - 4; dh = ch - 2;
-                    shape = "portal";
-                } else if (tn && tn.indexOf("pad") >= 0) {
-                    shape = "pad";
-                } else if (tn === "slope") {
-                    shape = "slope";
-                } else if (tn === "slopeFlip") {
-                    shape = "slopeFlip";
-                }
-                lbDecoDrawGridPixels(pl.grid, dx, dy, dw, dh, shape);
-                pop();
-            }
-        }
-    }
-    // Freehand deco strokes (your custom drawing)
-    if (levelBuilder.decoStrokes && levelBuilder.decoStrokes.length) {
-        for (const st of levelBuilder.decoStrokes) {
-            if (!st.pts || !st.pts.length) continue;
-            const col = st.color || [210, 160, 255];
-            const sz = (st.size || 0.35) * cw;
-            stroke(col[0], col[1], col[2], 230);
-            strokeWeight(max(2, sz));
-            strokeJoin(ROUND); strokeCap(ROUND);
-            noFill();
-            if (st.pts.length === 1) {
-                noStroke();
-                fill(col[0], col[1], col[2], 230);
-                const p = st.pts[0];
-                const vi = p.x - scrollC, vr = levelBuilder.rows - p.y;
-                ellipse(gx + vi * cw, gy + vr * ch, sz, sz);
-            } else {
-                beginShape();
-                for (const p of st.pts) {
-                    const vi = p.x - scrollC;
-                    const vr = levelBuilder.rows - p.y;
-                    vertex(gx + vi * cw, gy + vr * ch);
-                }
-                endShape();
-            }
-        }
+        gdGroundY = L.groundY;
+        gdCeilY = L.ceilY;
+        // Scroll so column `scrollC` is at the left of the view
+        gdScroll = (L.startX != null ? L.startX : LB_START_X) + scrollC * cw - 8;
+        gdCube = null;
+        gdCube2 = null;
+        gdDual = false;
+
+        // Fit world vertically into middle band (keep aspect of blocks)
+        const worldH = Math.max(1, gdGroundY - gdCeilY);
+        const scaleY = viewH / worldH;
+        // Prefer 1:1 if it mostly fits; otherwise scale to fit
+        const s = (worldH <= viewH + 8) ? 1 : scaleY;
+        // After scale, place ground at viewBot
+        // screenY = viewBot - (gdGroundY - worldY) * s
+        //          = worldY * s + (viewBot - gdGroundY * s)
+        const yShift = viewBot - gdGroundY * s;
+        levelBuilder._viewMap = { s, yShift, viewTop, viewBot, scrollX: gdScroll };
+
+        push();
+        drawingContext.save();
+        drawingContext.beginPath();
+        drawingContext.rect(0, viewTop, sirina, viewH);
+        drawingContext.clip();
+
+        // Solid playfield backdrop (always visible, even if izrisiOzadje fails)
         noStroke();
+        fill(12, 14, 28);
+        rect(0, viewTop, sirina, viewH);
+
+        // Transform into world space
+        translate(0, yShift);
+        scale(1, s);
+
+        // Soft ambient
+        noStroke();
+        fill(30, 20, 100, 40);
+        rect(-20, gdCeilY - 40, sirina + 40, (gdGroundY - gdCeilY) + 80);
+
+        // Parallax lines
+        stroke(90, 70, 150, 70); strokeWeight(1 / s);
+        let off = (gdScroll * 0.25) % 40;
+        for (let x = -off; x < sirina + 40; x += 40) line(x, gdCeilY, x, gdGroundY);
+
+        // Ceiling
+        noStroke();
+        fill(18, 18, 34, 240);
+        rect(-20, gdCeilY - 200, sirina + 40, 200);
+        fill(145, 105, 245, 235);
+        rect(-20, gdCeilY - 4, sirina + 40, 4);
+        fill(220, 195, 255, 220);
+        rect(-20, gdCeilY - 1, sirina + 40, 1);
+
+        // Ground
+        fill(25, 25, 40);
+        rect(-20, gdGroundY, sirina + 40, 400);
+        fill(120, 90, 220);
+        rect(-20, gdGroundY, sirina + 40, 4);
+
+        // Obstacles (game renderer) — scale stroke roughly
+        if (typeof _lbDrawObstaclesLikeGame === 'function') {
+            _lbDrawObstaclesLikeGame();
+        }
+
+        // Cell guides
+        const m = builderWorldMetrics();
+        stroke(255, 255, 255, 28); strokeWeight(1 / s);
+        for (let vi = 0; vi <= vis + 1; vi++) {
+            const c = scrollC + vi;
+            const wx = m.startX + c * m.cellW - gdScroll;
+            line(wx, gdCeilY, wx, gdGroundY);
+        }
+        for (let r = 0; r <= levelBuilder.rows; r++) {
+            const wy = gdGroundY - r * m.blockH;
+            line(-10, wy, sirina + 10, wy);
+        }
+
+        // Selection
+        const keysSel = [];
+        if (levelBuilder.selectedCell) keysSel.push(levelBuilder.selectedCell);
+        if (levelBuilder.selectedCells) {
+            for (const k of levelBuilder.selectedCells) if (keysSel.indexOf(k) < 0) keysSel.push(k);
+        }
+        for (const cellKey of keysSel) {
+            const parts = cellKey.split(',').map(Number);
+            const r = parts[0], c = parts[1];
+            if (c < scrollC - 1 || c >= scrollC + vis + 1) continue;
+            const sm = (levelBuilder.cellMeta && levelBuilder.cellMeta[cellKey]) || {};
+            const sox = Number(sm.ox) || 0, soy = Number(sm.oy) || 0;
+            const px = m.startX + c * m.cellW + sox * m.cellW - gdScroll;
+            const py = gdGroundY - (r + 1) * m.blockH - soy * m.blockH;
+            noFill(); stroke(255, 255, 80, 230); strokeWeight(2 / s);
+            rect(px + 1, py + 1, m.cellW - 2, m.blockH - 2);
+        }
+
+
+        // Last attempt hitbox trail (K) — kept after death for review in editor
+        if ((levelBuilder.showHitboxTrail || levelBuilder.showHitboxes) && levelBuilder.hitboxTrail && levelBuilder.hitboxTrail.length) {
+            noFill();
+            const trail = levelBuilder.hitboxTrail;
+            for (let i = 0; i < trail.length; i++) {
+                const t = trail[i];
+                if (!t || !t.full) continue;
+                stroke(0, 220, 255, 160); strokeWeight(1.2 / s);
+                rect(t.full.x - gdScroll, t.full.y, t.full.w, t.full.h);
+                if (t.core) {
+                    stroke(255, 40, 220, 200); strokeWeight(1.6 / s);
+                    rect(t.core.x - gdScroll, t.core.y, t.core.w, t.core.h);
+                }
+                if (t.dual) {
+                    stroke(255, 180, 40, 180); strokeWeight(1.2 / s);
+                    rect(t.dual.x - gdScroll, t.dual.y, t.dual.w, t.dual.h);
+                }
+            }
+        }
+        // Obstacle hitboxes in editor (when HIT / H is on)
+        if (levelBuilder.showHitboxes && gdObstacles) {
+            noFill();
+            for (let o of gdObstacles) {
+                if (!o || o.type === "decoPixel" || o.type === "decoStroke" || o.type === "deco") continue;
+                const sx = o.x - gdScroll;
+                if (sx + (o.w || 40) < -40 || sx > sirina + 40) continue;
+                if (o.type === "spike" || o.type === "spikeDown") {
+                    stroke(255, 60, 60, 220); strokeWeight(1.5 / s);
+                    if (o.type === "spike") triangle(sx, o.y + o.h, sx + o.w / 2, o.y, sx + o.w, o.y + o.h);
+                    else triangle(sx, o.y, sx + o.w / 2, o.y + o.h, sx + o.w, o.y);
+                } else if (o.type === "sawblade" || (o.type && o.type.indexOf("orb") >= 0) || o.type === "secretCoin") {
+                    stroke(255, 220, 60, 220); strokeWeight(1.5 / s);
+                    ellipse(sx + o.w / 2, o.y + o.h / 2, o.w, o.h);
+                } else if (o.type === "waveSlope") {
+                    stroke(255, 100, 220, 200); strokeWeight(1.5 / s);
+                    line(sx, o.top1, sx + o.w, o.top2);
+                    line(sx, o.bottom1, sx + o.w, o.bottom2);
+                } else {
+                    stroke(0, 255, 180, 200); strokeWeight(1.5 / s);
+                    rect(sx, o.y, o.w || 20, o.h || 20);
+                }
+            }
+        }
+
+        // Empty hint
+        if (!gdObstacles || gdObstacles.length === 0) {
+            fill(180, 200, 255, 160); noStroke();
+            textSize(14 / s); textAlign(CENTER, CENTER);
+            text("Izberi orodje in klikni na polje — ovire se rišejo kot v igri", sirina / 2, (gdCeilY + gdGroundY) / 2);
+        }
+
+        drawingContext.restore();
+        pop();
+    } catch (err) {
+        try { drawingContext.restore(); } catch (e2) {}
+        try { pop(); } catch (e3) {}
+        console.error("Level builder view error:", err);
+        fill(255, 80, 80); textSize(12); textAlign(CENTER, CENTER);
+        text("Builder view error — see console", sirina / 2, (viewTop + viewBot) / 2);
+    } finally {
+        gdObstacles = prevObs;
+        gdScroll = prevScroll;
+        gdGroundY = prevG;
+        gdCeilY = prevCeil;
+        gdCube = prevCube;
+        gdCube2 = prevCube2;
+        gdDual = prevDual;
     }
 
-    // ground line
-    stroke(120, 90, 220); strokeWeight(2);
-    line(gx, gy + levelBuilder.rows * ch, gx + vis * cw, gy + levelBuilder.rows * ch);
-    noStroke();
-    // Level scrollbar (drag) — own row under grid
-    const barY = L.barY != null ? L.barY : (gy + levelBuilder.rows * ch + 2);
-    const barX = gx, barW = vis * cw, barH = 10;
+    // Level scrollbar (drag) — in bottom UI band
+    const barY = L.barY != null ? L.barY : (sirina - (L.bottomUI || 128) + 2);
+    const barX = 8, barW = sirina - 100, barH = 10;
     fill(40, 45, 60); rect(barX, barY, barW, barH, 3);
     if (levelBuilder.cols > vis) {
         const maxScroll = max(0, levelBuilder.cols - vis);
@@ -2026,13 +2110,14 @@ function drawLevelBuilderMenu() {
             .replace("gravityUp","grav↑").replace("gravityDown","grav↓")
             .replace("secretCoin","coin").replace("waveSlope","wave").replace("spikeDown","spk↓")
             .replace("startPos","start").replace("checkpoint","check")
-            .replace("erase","ERASE").replace("deco","DECO");
+            .replace("decoErase","D-ERASE").replace("erase","ERASE").replace("deco","DECO");
     }
     const toolRowsVisible = L.toolRowsVisible || 3;
     const totalToolRows = Math.ceil(tools.length / perRow);
     const maxToolScroll = max(0, totalToolRows - toolRowsVisible);
     levelBuilder.toolScroll = constrain(levelBuilder.toolScroll || 0, 0, maxToolScroll);
     const tScroll = levelBuilder.toolScroll || 0;
+    const rowHDraw = L.toolRowH || 17;
     for (let row = 0; row < toolRowsVisible; row++) {
         const tr = row + tScroll;
         if (tr >= totalToolRows) break;
@@ -2041,85 +2126,84 @@ function drawLevelBuilderMenu() {
             if (i >= tools.length) break;
             const on = levelBuilder.tool === i;
             const isErase = tools[i] === "erase";
+            const isDecoErase = tools[i] === "decoErase";
             const isDeco = tools[i] === "deco";
-            fill(on ? color(0, 255, 170) : (isErase ? color(90, 30, 40) : (isDeco ? color(60, 40, 90) : color(55))));
+            fill(on ? color(0, 255, 170) : (isDecoErase ? color(130, 75, 20) : (isErase ? color(90, 30, 40) : (isDeco ? color(60, 40, 90) : color(55)))));
             const bx = 6 + col * 54;
-            const by = toolsY0 + row * 18;
-            rect(bx, by, 52, 16, 3);
+            const by = toolsY0 + row * rowHDraw;
+            rect(bx, by, 52, rowHDraw - 1, 3);
             fill(on ? 10 : 230); textSize(6);
-            text(lbShort(tools[i]).slice(0, 8).toUpperCase(), bx + 26, by + 8);
+            text(lbShort(tools[i]).slice(0, 8).toUpperCase(), bx + 26, by + rowHDraw / 2);
         }
     }
     const arrowX = 6 + perRow * 54 + 2;
-    fill(70); rect(arrowX, toolsY0, 18, 16, 3); fill(255); textSize(8); text("▲", arrowX + 9, toolsY0 + 8);
-    fill(70); rect(arrowX, toolsY0 + 36, 18, 16, 3); fill(255); text("▼", arrowX + 9, toolsY0 + 44);
-    // Always-visible ERASE + DECO shortcuts
+    const toolsH = L.toolsH || 34;
+    fill(70); rect(arrowX, toolsY0, 18, 15, 3); fill(255); textSize(8); text("▲", arrowX + 9, toolsY0 + 7);
+    fill(70); rect(arrowX, toolsY0 + toolsH - 15, 18, 15, 3); fill(255); text("▼", arrowX + 9, toolsY0 + toolsH - 8);
+    // Always-visible ERASE + DECO shortcuts (fit inside tools band)
     const ei = tools.indexOf("erase"), di = tools.indexOf("deco");
+    const dei = tools.indexOf("decoErase");
     const pinX = arrowX + 22;
+    const pinH = Math.max(14, Math.floor(((L.toolsH || 34) - 4) / 3));
     if (ei >= 0) {
         fill(levelBuilder.tool === ei ? color(0, 255, 170) : color(90, 30, 40));
-        rect(pinX, toolsY0, 44, 16, 3); fill(255); textSize(7); text("ERASE", pinX + 22, toolsY0 + 8);
-        levelBuilder._pinErase = { x: pinX, y: toolsY0, w: 44, h: 16, idx: ei };
+        rect(pinX, toolsY0, 48, pinH, 3); fill(255); textSize(6); text("ERASE", pinX + 24, toolsY0 + pinH / 2);
+        levelBuilder._pinErase = { x: pinX, y: toolsY0, w: 48, h: pinH, idx: ei };
     }
     if (di >= 0) {
         fill(levelBuilder.tool === di ? color(0, 255, 170) : color(60, 40, 90));
-        rect(pinX, toolsY0 + 20, 44, 16, 3); fill(255); textSize(7); text("DECO", pinX + 22, toolsY0 + 28);
-        levelBuilder._pinDeco = { x: pinX, y: toolsY0 + 20, w: 44, h: 16, idx: di };
+        rect(pinX, toolsY0 + pinH + 2, 48, pinH, 3); fill(255); textSize(6); text("DECO", pinX + 24, toolsY0 + pinH + 2 + pinH / 2);
+        levelBuilder._pinDeco = { x: pinX, y: toolsY0 + pinH + 2, w: 48, h: pinH, idx: di };
+    }
+    if (dei >= 0) {
+        fill(levelBuilder.tool === dei ? color(0, 255, 170) : color(130, 75, 20));
+        rect(pinX, toolsY0 + 2 * (pinH + 2), 48, pinH, 3); fill(255); textSize(5); text("D-ERASE", pinX + 24, toolsY0 + 2 * (pinH + 2) + pinH / 2);
+        levelBuilder._pinDecoErase = { x: pinX, y: toolsY0 + 2 * (pinH + 2), w: 48, h: pinH, idx: dei };
     }
     levelBuilder._toolPanel = { y0: toolsY0, perRow, rowsVis: toolRowsVisible, maxScroll: maxToolScroll, arrowX };
 
     const btnY = L.btnY;
+    const bh = (L.btnH || 22) - 2;
     textAlign(CENTER, CENTER); textSize(8);
-    // Single compact action row (all on screen)
-    fill(255, 170, 60); rect(4, btnY, 48, 20, 4); fill(15); text("PLAY", 28, btnY + 10);
-    fill(60, 200, 120); rect(54, btnY, 44, 20, 4); fill(15); text("SAVE", 76, btnY + 10);
-    fill(90, 160, 255); rect(100, btnY, 44, 20, 4); fill(15); text("UPD", 122, btnY + 10);
-    fill(220, 70, 70); rect(146, btnY, 40, 20, 4); fill(255); text("DEL", 166, btnY + 10);
-    fill(80); rect(188, btnY, 40, 20, 4); fill(220); text("CLR", 208, btnY + 10);
-    fill(levelBuilder.selectMode ? color(0, 220, 170) : color(65, 80, 110)); rect(230, btnY, 40, 20, 4); fill(255); text("SEL", 250, btnY + 10);
-    fill(100, 90, 180); rect(272, btnY, 36, 20, 4); fill(255); text("S−", 290, btnY + 10);
-    fill(30, 150, 130); rect(310, btnY, 36, 20, 4); fill(255); text("S+", 328, btnY + 10);
-    // nudge on same row
-    fill(200, 110, 40); rect(352, btnY, 28, 20, 4); fill(255); text("←", 366, btnY + 10);
-    fill(200, 110, 40); rect(382, btnY, 28, 20, 4); fill(255); text("→", 396, btnY + 10);
-    fill(200, 110, 40); rect(412, btnY, 28, 20, 4); fill(255); text("↑", 426, btnY + 10);
-    fill(200, 110, 40); rect(442, btnY, 28, 20, 4); fill(255); text("↓", 456, btnY + 10);
-    fill(160, 80, 200); rect(472, btnY, 36, 20, 4); fill(255); text("ROT", 490, btnY + 10);
+    // One clean row: PLAY BACK CLR SEL | S- S+ | ← → ↑ ↓ ROT  (auto-save, no UPD)
+    // Positions stored for hit-testing
+    const B = [];
+    function addBtn(x, w, label, fillC, textC) {
+        fill(fillC); rect(x, btnY, w, bh, 4);
+        fill(textC); text(label, x + w / 2, btnY + bh / 2);
+        B.push({ x, w, label });
+        return x + w + 4;
+    }
+    let bx = 4;
+    bx = addBtn(bx, 48, "PLAY", color(255, 170, 60), color(15));
+    bx = addBtn(bx, 44, "BACK", color(80, 100, 140), color(230));
+    bx = addBtn(bx, 36, "CLR", color(70), color(220));
+    bx = addBtn(bx, 36, levelBuilder.selectMode ? "SEL*" : "SEL",
+        levelBuilder.selectMode ? color(0, 220, 170) : color(65, 80, 110), color(255));
+    bx += 6;
+    bx = addBtn(bx, 32, "S−", color(100, 90, 180), color(255));
+    bx = addBtn(bx, 32, "S+", color(30, 150, 130), color(255));
+    bx += 6;
+    bx = addBtn(bx, 26, "←", color(200, 110, 40), color(255));
+    bx = addBtn(bx, 26, "→", color(200, 110, 40), color(255));
+    bx = addBtn(bx, 26, "↑", color(200, 110, 40), color(255));
+    bx = addBtn(bx, 26, "↓", color(200, 110, 40), color(255));
+    bx = addBtn(bx, 34, "ROT", color(160, 80, 200), color(255));
+    levelBuilder._actionBtns = B;
     const selectedMeta = levelBuilder.selectedCell && levelBuilder.cellMeta ? (levelBuilder.cellMeta[levelBuilder.selectedCell] || {}) : {};
     const ox = Number(selectedMeta.ox) || 0, oy = Number(selectedMeta.oy) || 0;
     const srot = Number(selectedMeta.rot) || 0;
-    fill(200); textSize(7); textAlign(LEFT, CENTER);
-    text((ox.toFixed(1)+","+oy.toFixed(1)) + (srot ? (" r"+srot+"°") : ""), 512, btnY + 10);
+    fill(180); textSize(7); textAlign(LEFT, CENTER);
+    // show selection offset next to ROT if room
+    if (bx + 8 < sirina - 4) {
+        text((ox.toFixed(1)+","+oy.toFixed(1)) + (srot ? (" r"+srot+"°") : ""), min(bx + 4, sirina - 80), btnY + bh / 2);
+    }
 
-    // Saved levels (thin bar)
-    const sY = btnY + 24;
-    fill(25, 30, 45); rect(4, sY, sirina - 8, 36, 4);
-    const savedPages = Math.max(1, Math.ceil(levelBuilder.saved.length / 10));
-    levelBuilder.savedPage = constrain(levelBuilder.savedPage || 0, 0, savedPages - 1);
-    fill(160); textSize(7); textAlign(LEFT, TOP);
-    text("Saved (" + levelBuilder.saved.length + "):", 8, sY + 2);
-    textAlign(CENTER, CENTER);
-    fill(65, 80, 110); rect(520, sY + 2, 22, 12, 3); fill(255); textSize(8); text("<", 531, sY + 8);
-    fill(65, 80, 110); rect(544, sY + 2, 22, 12, 3); fill(255); text(">", 555, sY + 8);
-    fill(180); textSize(7); text((levelBuilder.savedPage + 1) + "/" + savedPages, 500, sY + 8);
-    textAlign(LEFT, CENTER);
-    let sx = 8, sy = sY + 24;
-    const pageStart = levelBuilder.savedPage * 10;
-    for (let i = pageStart; i < Math.min(levelBuilder.saved.length, pageStart + 10); i++) {
-        const savedLevel = levelBuilder.saved[i];
-        const on = levelBuilder.saveIdx === i;
-        fill(on ? color(0, 200, 160) : color(50, 55, 70));
-        rect(sx, sy - 7, 48, 14, 3);
-        fill(on ? 10 : 220); textSize(7);
-        text((savedLevel.name || "Lv").slice(0, 6), sx + 2, sy);
-        sx += 49;
-    }
+    // Status message floats just above the scrollbar (inside playfield edge)
     if (levelBuilder.msg) {
-        fill(255, 220, 80); textSize(9); textAlign(CENTER, CENTER);
-        text(levelBuilder.msg, sirina / 2, min(btnY + 64, sirina - 8));
+        fill(255, 220, 80); textSize(10); textAlign(CENTER, CENTER);
+        text(levelBuilder.msg, sirina / 2, (L.barY || 500) - 10);
     }
-    fill(130); textSize(8); textAlign(RIGHT, CENTER);
-    text("drag paint • arrows scroll", sirina - 8, min(btnY + 64, sirina - 8));
 
     // ===== DECO PIXEL EDITOR (like custom head) =====
     if (levelBuilder.decoEditor) {
@@ -2245,11 +2329,27 @@ function builderRedo() {
 function builderPaintCellAt(mx, my, dragMode) {
     if (levelBuilder.selectMode) return false; // never paint while selecting
     const L = builderLayout();
-    const gx = L.gx, gy = L.gy, cw = L.cw, ch = L.ch, vis = LB_EDITOR_VISIBLE_COLS;
-    if (my < gy || my >= gy + levelBuilder.rows * ch || mx < gx || mx >= gx + vis * cw) return false;
-    const vi = floor((mx - gx) / cw), c = (levelBuilder.scrollC || 0) + vi;
-    const vr = floor((my - gy) / ch), r = levelBuilder.rows - 1 - vr;
+    const m = builderWorldMetrics();
+    const vis = L.visCols || Math.max(4, Math.floor(sirina / m.cellW));
+    const scrollC = levelBuilder.scrollC || 0;
+    const scrollX = (L.startX != null ? L.startX : LB_START_X) + scrollC * m.cellW - 8;
+    const viewTop = L.topUI || 64;
+    const viewBot = sirina - (L.bottomUI || 118);
+    if (my < viewTop || my >= viewBot) return false;
+    // Inverse of editor view transform: screen → world
+    const vm = levelBuilder._viewMap;
+    let worldY, worldX;
+    if (vm && vm.s) {
+        worldY = (my - vm.yShift) / vm.s;
+        worldX = mx + (vm.scrollX != null ? vm.scrollX : scrollX);
+    } else {
+        worldY = my;
+        worldX = mx + scrollX;
+    }
+    const r = floor((m.g - worldY) / m.blockH);
+    const c = floor((worldX - m.startX) / m.cellW);
     if (r < 0 || r >= levelBuilder.rows || c < 0 || c >= levelBuilder.cols || !levelBuilder.grid[r]) return false;
+    const gx = 0, gy = viewTop, cw = m.cellW, ch = m.blockH;
     const tools = builderCurrentTools(), next = levelBuilder.tool + 1, tname = tools[levelBuilder.tool];
     const key = r + "," + c;
     levelBuilder.selectedCell = key;
@@ -2257,6 +2357,14 @@ function builderPaintCellAt(mx, my, dragMode) {
     if (dragMode && levelBuilder.dragPaintLast === key && _tchk !== "deco") return true;
     const old = levelBuilder.grid[r][c] || 0;
     // ERASE tool: clear any object in cell (no need to match type)
+    if (tname === "decoErase") {
+        if (!dragMode) builderPushUndo();
+        const got = typeof lbDecoEraseAt === "function" && lbDecoEraseAt(r, c);
+        if (!got && !dragMode && levelBuilder.undoStack && levelBuilder.undoStack.length) levelBuilder.undoStack.pop();
+        levelBuilder.msg = got ? "Decoration erased" : "No decoration here";
+        levelBuilder.dragPaintLast = key;
+        return true;
+    }
     if (tname === "erase") {
         const hasDeco = (levelBuilder.decoPlacements && levelBuilder.decoPlacements[key])
             || (levelBuilder.decoCells && levelBuilder.decoCells[key]);
@@ -2374,28 +2482,39 @@ function builderResizeSelected(delta) {
 // Hit-test by visual position (ox/oy + scale), not just grid slot
 function builderPickKeyAt(mx, my) {
     const L = builderLayout();
-    const gx = L.gx, gy = L.gy, cw = L.cw, ch = L.ch;
-    const vis = LB_EDITOR_VISIBLE_COLS;
+    const m = builderWorldMetrics();
+    const vis = L.visCols || Math.max(4, Math.floor(sirina / m.cellW));
     const scrollC = levelBuilder.scrollC || 0;
-    let best = null, bestDist = 1e9;
+    const scrollX = (L.startX != null ? L.startX : LB_START_X) + scrollC * m.cellW - 8;
+    const viewTop = L.topUI || 64;
+    const viewBot = sirina - (L.bottomUI || 118);
+    if (my < viewTop || my >= viewBot) return null;
+    const vm = levelBuilder._viewMap;
+    const s = (vm && vm.s) ? vm.s : 1;
+    const yShift = (vm && vm.yShift != null) ? vm.yShift : 0;
+    const scrX = (vm && vm.scrollX != null) ? vm.scrollX : scrollX;
+    const worldY = (my - yShift) / s;
+    const worldX0 = mx + scrX;
+    let best = null, bestDist = 1e18;
     for (let r = 0; r < levelBuilder.rows; r++) {
-        if (!levelBuilder.grid[r]) continue;
-        for (let vi = 0; vi < vis; vi++) {
-            const c = scrollC + vi;
-            if (c >= levelBuilder.cols) break;
-            const v = levelBuilder.grid[r][c];
-            if (!v) continue;
+        for (let vi = 0; vi < vis + 2; vi++) {
+            const c = scrollC + vi - 1;
+            if (c < 0 || c >= levelBuilder.cols) continue;
+            if (!levelBuilder.grid[r] || !levelBuilder.grid[r][c]) continue;
             const key = r + "," + c;
             const meta = (levelBuilder.cellMeta && levelBuilder.cellMeta[key]) || {};
             const ox = Number(meta.ox) || 0;
             const oy = Number(meta.oy) || 0;
             const sc = constrain(Number(meta.scale) || 1, 0.5, 18);
-            const vr = levelBuilder.rows - 1 - r;
-            const px = gx + vi * cw + ox * cw;
-            const py = gy + vr * ch - oy * ch;
-            // visual rect (scaled around center)
-            const cx = px + cw / 2, cy = py + ch / 2;
-            const hw = (cw * sc) * 0.55, hh = (ch * sc) * 0.55;
+            const px = m.startX + c * m.cellW + ox * m.cellW - scrX;
+            const py = m.g - (r + 1) * m.blockH - oy * m.blockH;
+            // to screen
+            const sx = px;
+            const sy = py * s + yShift;
+            const cwS = m.cellW;
+            const chS = m.blockH * s;
+            const cx = sx + cwS / 2, cy = sy + chS / 2;
+            const hw = (cwS * sc) * 0.55, hh = (chS * sc) * 0.55;
             if (mx >= cx - hw && mx <= cx + hw && my >= cy - hh && my <= cy + hh) {
                 const d = (mx - cx) * (mx - cx) + (my - cy) * (my - cy);
                 if (d < bestDist) { bestDist = d; best = key; }
@@ -2403,14 +2522,11 @@ function builderPickKeyAt(mx, my) {
         }
     }
     if (best) return best;
-    // fallback: raw grid cell (paste target / empty)
-    if (my < gy || my >= gy + levelBuilder.rows * ch || mx < gx || mx >= gx + vis * cw) return null;
-    const vi = floor((mx - gx) / cw), c = scrollC + vi;
-    const vr = floor((my - gy) / ch), r = levelBuilder.rows - 1 - vr;
+    const c = floor((worldX0 - m.startX) / m.cellW);
+    const r = floor((m.g - worldY) / m.blockH);
     if (r < 0 || r >= levelBuilder.rows || c < 0 || c >= levelBuilder.cols) return null;
     return r + "," + c;
 }
-
 function builderGetSelectionKeys() {
     let keys = (levelBuilder.selectedCells && levelBuilder.selectedCells.length)
         ? levelBuilder.selectedCells.slice()
@@ -2753,6 +2869,7 @@ function builderInstallShowcaseDemo() {
     levelBuilder.msg = "Loaded: Grok Showcase — PLAY to try (easy/medium, new features)";
 }
 
+
 function builderCurrentTools() {
     return levelBuilderToolsGD;
 }
@@ -2852,25 +2969,52 @@ function builderDeleteLevel() {
     levelBuilder.msg = "Deleted: " + name + " (" + levelBuilder.saved.length + " left)";
 }
 function builderEncode() {
-    return btoa(JSON.stringify({
-        mode: levelBuilder.mode, grid: levelBuilder.grid, name: levelBuilder.name,
-        portalTarget: levelBuilder.portalTarget, cols: levelBuilder.cols, rows: levelBuilder.rows
-    }));
+    // Versioned share payload: preserve decorations and per-cell editor settings too.
+    const payload = {
+        version: 2,
+        mode: levelBuilder.mode,
+        grid: levelBuilder.grid,
+        name: levelBuilder.name,
+        portalTarget: levelBuilder.portalTarget,
+        cols: levelBuilder.cols,
+        rows: levelBuilder.rows,
+        cellMeta: levelBuilder.cellMeta || {},
+        decoCells: levelBuilder.decoCells || {},
+        decoStrokes: levelBuilder.decoStrokes || [],
+        decoLibrary: levelBuilder.decoLibrary || [],
+        decoPlacements: levelBuilder.decoPlacements || {},
+        decoDraft: levelBuilder.decoDraft || null,
+        musicUrl: levelBuilder.musicUrl || ""
+    };
+    // UTF-8 safe Base64 (works with Slovenian names and other Unicode text).
+    const bytes = new TextEncoder().encode(JSON.stringify(payload));
+    let binary = "";
+    bytes.forEach(b => binary += String.fromCharCode(b));
+    return btoa(binary);
 }
 function builderDecode(code) {
     try {
-        let data = JSON.parse(atob(code));
+        let binary = atob(String(code).trim());
+        let bytes = Uint8Array.from(binary, ch => ch.charCodeAt(0));
+        let data;
+        try { data = JSON.parse(new TextDecoder().decode(bytes)); }
+        catch (_) { data = JSON.parse(binary); } // backwards compatibility with older ASCII codes
         if (Array.isArray(data)) { levelBuilder.grid = data; return true; }
-        if (data.grid) {
-            levelBuilder.grid = data.grid;
-            if (data.mode) levelBuilder.mode = data.mode;
-            if (data.name) levelBuilder.name = data.name;
-            if (data.portalTarget) levelBuilder.portalTarget = data.portalTarget;
-            if (data.cols) levelBuilder.cols = data.cols;
-            if (data.rows) levelBuilder.rows = data.rows;
-            return true;
-        }
-        return false;
+        if (!data || !data.grid) return false;
+        levelBuilder.grid = data.grid;
+        if (data.mode) levelBuilder.mode = data.mode;
+        if (data.name != null) levelBuilder.name = data.name;
+        if (data.portalTarget) levelBuilder.portalTarget = data.portalTarget;
+        if (data.cols) levelBuilder.cols = data.cols;
+        if (data.rows) levelBuilder.rows = data.rows;
+        if (data.cellMeta) levelBuilder.cellMeta = JSON.parse(JSON.stringify(data.cellMeta));
+        if (data.decoCells) levelBuilder.decoCells = JSON.parse(JSON.stringify(data.decoCells));
+        if (data.decoStrokes) levelBuilder.decoStrokes = JSON.parse(JSON.stringify(data.decoStrokes));
+        if (data.decoLibrary) levelBuilder.decoLibrary = JSON.parse(JSON.stringify(data.decoLibrary));
+        if (data.decoPlacements) levelBuilder.decoPlacements = JSON.parse(JSON.stringify(data.decoPlacements));
+        if (data.decoDraft !== undefined) levelBuilder.decoDraft = data.decoDraft ? JSON.parse(JSON.stringify(data.decoDraft)) : null;
+        if (data.musicUrl !== undefined) levelBuilder.musicUrl = data.musicUrl || "";
+        return true;
     } catch (e) { return false; }
 }
 
@@ -2888,46 +3032,18 @@ function lbEffectFromRot(baseFacing, rot) {
     return { facing: bf, axis: "y" };
 }
 
-function startBuilderTest(fromCol) {
-    // Platformer = same level + same physics as classic, only movement differs (arrows vs auto-scroll)
-    gdPlatformerMode = (levelBuilder.mode === "platformer");
-    lbPlayLevelMusic();
+function builderCompileLevelObstacles() {
     const tools = levelBuilderToolsGD;
-    gdVehicle = "cube";
-    gdGroundY = sirina - 80;
-    // The builder's ROW count controls the playable ceiling. Scale each row
-    // to fit the available playfield, so changing ROW+/ROW- changes real space.
-    // Each editor row represents a fixed chunk of real vertical space.
-    // More ROWs therefore move the ceiling upward and enlarge the playable area;
-    // fewer ROWs lower it. Clamp only to keep a minimum safe playfield.
-    const builderWorldCellH = Math.max(20, (gdGroundY - 40) / 18);
-    gdCeilY = Math.max(32, gdGroundY - levelBuilder.rows * builderWorldCellH);
-    gdScroll = 0;
-    gdSpeed = 5.2;
-    gdWon = false;
-    gameOver = false;
-    winScreen = false;
-    jumpscare = false;
-    pavza = false;
-    gdStarted = true;
-    gdGravityDir = 1;
-    gdBallGravity = 1;
-    gdSwingDir = 1;
-    gdDual = false;
-    gdCube2 = null;
-    gdVehicle2 = "cube";
-    gdGravityDir2 = -1;
-    gdPlayerSize = (typeof GD_SIZE_NORMAL !== "undefined") ? GD_SIZE_NORMAL : 1;
-    gdPlayerSize2 = gdPlayerSize;
-    gdWaveTrail2 = [];
-    gdCube = { x: 100, y: gdGroundY - 28, w: 28, h: 28, vy: 0, onGround: true, rot: 0, shipUp: false };
+    const m = builderWorldMetrics();
+    gdGroundY = m.g;
+    gdCeilY = m.ceilY;
+    const g = gdGroundY;
     gdObstacles = [];
     let secretCount = 0;
     let hasEnd = false;
     levelBuilder._startWorldX = null;
     levelBuilder._startWorldY = null;
     gdLevelCheckpoint = null;
-    const g = gdGroundY;
 
     for (let r = 0; r < levelBuilder.rows; r++) {
         for (let c = 0; c < levelBuilder.cols; c++) {
@@ -2943,7 +3059,7 @@ function startBuilderTest(fromCol) {
             const yTop = g - (r + 1) * blockH - (Number(meta.oy) || 0) * blockH;
             const firstObstacleIndex = gdObstacles.length;
 
-            if (tname === "erase") {
+            if (tname === "erase" || tname === "decoErase") {
                 // editor-only
             } else if (tname === "deco") {
                 gdObstacles.push({ type: "deco", x: x + 2, y: yTop + 2, w: LB_CELL_W - 4, h: blockH - 4 });
@@ -3406,16 +3522,52 @@ function startBuilderTest(fromCol) {
         const endX = LB_START_X + levelBuilder.cols * LB_CELL_W + 80;
         gdObstacles.push({ type: "goal", x: endX, y: gdCeilY, w: 10, h: g - gdCeilY });
     }
+}
 
+function startBuilderTest(fromCol) {
+    // Platformer = same level + same physics as classic, only movement differs (arrows vs auto-scroll)
+    gdPlatformerMode = (levelBuilder.mode === "platformer");
+    lbPlayLevelMusic();
+    const tools = levelBuilderToolsGD;
+    gdVehicle = "cube";
+    gdGroundY = sirina - 80;
+    // The builder's ROW count controls the playable ceiling. Scale each row
+    // to fit the available playfield, so changing ROW+/ROW- changes real space.
+    // Each editor row represents a fixed chunk of real vertical space.
+    // More ROWs therefore move the ceiling upward and enlarge the playable area;
+    // fewer ROWs lower it. Clamp only to keep a minimum safe playfield.
+    const builderWorldCellH = Math.max(20, (gdGroundY - 40) / 18);
+    gdCeilY = Math.max(32, gdGroundY - levelBuilder.rows * builderWorldCellH);
+    gdScroll = 0;
+    // A new test attempt starts with a clean, stationary hitbox path.
+    if (levelBuilder) levelBuilder.hitboxTrail = [];
+    gdSpeed = 5.2;
+    gdWon = false;
+    gameOver = false;
+    winScreen = false;
+    jumpscare = false;
+    pavza = false;
+    gdStarted = true;
+    gdGravityDir = 1;
+    gdBallGravity = 1;
+    gdSwingDir = 1;
+    gdDual = false;
+    gdCube2 = null;
+    gdVehicle2 = "cube";
+    gdGravityDir2 = -1;
+    gdPlayerSize = (typeof GD_SIZE_NORMAL !== "undefined") ? GD_SIZE_NORMAL : 1;
+    gdPlayerSize2 = gdPlayerSize;
+    gdWaveTrail2 = [];
+    gdCube = { x: 100, y: gdGroundY - 28, w: 28, h: 28, vy: 0, onGround: true, rot: 0, shipUp: false };
+    builderCompileLevelObstacles();
     // Apply custom start position (player stays near screen x=100, world scrolls)
     if (levelBuilder._startWorldX != null) {
         gdScroll = max(0, levelBuilder._startWorldX - 100);
-        if (levelBuilder._startWorldY != null) {
+        if (levelBuilder._startWorldY != null && gdCube) {
             gdCube.y = constrain(levelBuilder._startWorldY, gdCeilY, gdGroundY - gdCube.h);
         }
-        gdCube.onGround = true;
+        if (gdCube) gdCube.onGround = true;
     }
-    // Play from column (0 is valid)
     if (fromCol != null && fromCol !== undefined && fromCol >= 0) {
         const wx = LB_START_X + Number(fromCol) * LB_CELL_W;
         gdScroll = max(0, wx - 100);
@@ -3680,6 +3832,16 @@ function playMenuSound() {
 function playJumpSound() {
     playToneSlide(280, 520, "square", 0.12, 0.16);
     playTone(640, "sine", 0.08, 0.08);
+}
+
+function playPortalSound() {
+    playToneSlide(360, 900, "sine", 0.18, 0.16);
+    playTone(1180, "triangle", 0.09, 0.08);
+}
+
+function playFallSound() {
+    playToneSlide(420, 95, "triangle", 0.32, 0.20);
+    playTone(72, "sine", 0.18, 0.10);
 }
 
 function playCoinSound() {
@@ -7077,8 +7239,8 @@ function updateGDAI() {
             let y = gdCube.y, vy = gdCube.vy || 0;
             let hit = false, minClear = 9999;
             for (let i = 0; i < horizon; i++) {
-                if (hold) vy -= 0.62; else vy += 0.62;
-                vy = constrain(vy, -7.8, 7.8);
+                if (hold) vy -= 0.95; else vy += 0.34;
+                vy = constrain(vy, -10.5, 5.6);
                 y += vy;
                 if (y < gdCeilY) { y = gdCeilY; vy = 0; }
                 if (y + gdCube.h > gdGroundY) { y = gdGroundY - gdCube.h; vy = 0; }
@@ -7347,7 +7509,7 @@ function gdCollectCoinsAndGoals() {
         if (!o) continue;
         const sx = o.x - gdScroll;
         if (o.type === "secretCoin" && !o._collected) {
-            if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) {
+            if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) {
                 o._collected = true;
                 o.type = "secretCoinGot";
                 kovanci += 50;
@@ -7356,7 +7518,7 @@ function gdCollectCoinsAndGoals() {
                 spawnParticles(gdCube.x + gdCube.w / 2, gdCube.y + gdCube.h / 2, 10, color(255, 215, 0));
             }
         } else if (o.type === "goal") {
-            if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) {
+            if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) {
                 gdFinish();
                 return;
             }
@@ -7368,6 +7530,9 @@ function gdApplyPadOrbs(opts) {
     if (!gdCube || gameOver || gdWon) return;
     opts = opts || {};
     const input = opts.input != null ? opts.input : gdHold();
+    // A held button may activate only the first orb it reaches. Release and
+    // press again to activate another orb (same rule for keyboard and mouse).
+    if (!input) gdOrbHoldConsumed = false;
     const primaryWave = (gdVehicle === "wave");
     const dualWave = (gdDual && gdVehicle2 === "wave");
     const gDir = gdGravityDir || 1;
@@ -7389,6 +7554,7 @@ function gdApplyPadOrbs(opts) {
         const hit2 = gdDual && gdCube2 && !dualWave &&
             rectsOverlap(gdCube2.x - 3, gdCube2.y - 3, gdCube2.w + 6, gdCube2.h + 6,
                 sx - 4, o.y - 4, o.w + 8, o.h + 8);
+        const orbPressAvailable = input && !gdOrbHoldConsumed;
         const facing = (o.facing != null) ? o.facing : 1;
 
         if (!hit1 && !hit2) {
@@ -7451,8 +7617,9 @@ function gdApplyPadOrbs(opts) {
 
         // --- ORBS: need click while overlapping; each icon independent ---
         if (o.type === "orbDash") {
-            if (input && hit1 && !o._dashUsed) {
+            if (orbPressAvailable && hit1 && !o._dashUsed) {
                 o._dashUsed = true;
+                gdOrbHoldConsumed = true;
                 if (!gdDashing) {
                     gdDashing = true;
                     gdDashTimer = 0;
@@ -7460,8 +7627,9 @@ function gdApplyPadOrbs(opts) {
                     spawnParticles(gdCube.x + gdCube.w / 2, gdCube.y + gdCube.h / 2, 8, color(40, 255, 100));
                 }
             }
-            if (input && hit2 && !o._dashUsed2) {
+            if (orbPressAvailable && hit2 && !o._dashUsed2) {
                 o._dashUsed2 = true;
+                gdOrbHoldConsumed = true;
                 if (!gdDashing) {
                     gdDashing = true;
                     gdDashTimer = 0;
@@ -7474,10 +7642,12 @@ function gdApplyPadOrbs(opts) {
 
         if (o.type === "orbPink" || o.type === "orbYellow" || o.type === "orbBlue"
             || o.type === "orbBlueTrue" || o.type === "orbBlack") {
-            if (!input) continue;
-            // primary
+            if (!orbPressAvailable) continue;
+            // primary and secondary can both react to the same press in dual mode.
+            let activatedThisOrb = false;
             if (hit1 && !o._orbUsed) {
                 o._orbUsed = true;
+                activatedThisOrb = true;
                 // facing/axis from editor ROT: 180 inverts boost, 90/270 = horizontal
                 const of = (o.facing != null) ? o.facing : 1;
                 const oaxis = o.axis || "y";
@@ -7505,6 +7675,7 @@ function gdApplyPadOrbs(opts) {
             }
             if (hit2 && !o._orbUsed2) {
                 o._orbUsed2 = true;
+                activatedThisOrb = true;
                 const of2 = (o.facing != null) ? o.facing : 1;
                 const oaxis2 = o.axis || "y";
                 if (o.type === "orbBlue") {
@@ -7528,6 +7699,7 @@ function gdApplyPadOrbs(opts) {
                 gdCube2.onGround = false;
                 playJumpSound();
             }
+            if (activatedThisOrb) gdOrbHoldConsumed = true;
         }
     }
 
@@ -7564,8 +7736,8 @@ function gdApplySpecialPortals() {
     for (let o of gdObstacles) {
         if (o.type !== "portalDual" && o.type !== "sizePortal" && o.type !== "endDual") continue;
         const sx = o.x - gdScroll;
-        const hit1 = rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h);
-        const hit2 = gdDual && gdCube2 && rectsOverlap(gdCube2.x, gdCube2.y, gdCube2.w, gdCube2.h, sx, o.y, o.w, o.h);
+        const hit1 = gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h);
+        const hit2 = gdDual && gdCube2 && gdPlayerRectOverlap(gdCube2, sx, o.y, o.w, o.h);
         if (!hit1 && !hit2) {
             o._inside = false; o._in1 = false; o._in2 = false;
             continue;
@@ -7573,6 +7745,7 @@ function gdApplySpecialPortals() {
         if (o.type === "sizePortal") {
             if (hit1 && !o._in1) {
                 o._in1 = true;
+                playPortalSound();
                 gdPlayerSize = o.size === "mini" ? GD_SIZE_MINI : GD_SIZE_NORMAL;
                 const ns = gdVehicleSize(gdVehicle, gdPlayerSize);
                 const cx = gdCube.x + gdCube.w / 2, cy = gdCube.y + gdCube.h / 2;
@@ -7592,6 +7765,7 @@ function gdApplySpecialPortals() {
         if (!hit1) continue; // dual/end dual still triggered by primary
         if (o.type === "portalDual" && !o._inside) {
             o._inside = true;
+            playPortalSound();
             if (!gdDual) {
                 gdDual = true;
                 // Dual always needs floor + ceiling icons, but keep current X and don't hard-kill momentum mid-portal
@@ -7690,7 +7864,7 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             if (o.type !== "checkpoint") continue;
             const sx = o.x - gdScroll;
-            if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) {
+            if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) {
                 if (!o.activated) {
                     o.activated = true;
                     gdLevelCheckpoint = {
@@ -7725,8 +7899,8 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             if (o.type !== "portal" || o.used) continue;
             const sx = o.x - gdScroll;
-            const hit1 = !o._used1 && rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h);
-            const hit2 = gdDual && gdCube2 && !o._used2 && rectsOverlap(gdCube2.x, gdCube2.y, gdCube2.w, gdCube2.h, sx, o.y, o.w, o.h);
+            const hit1 = !o._used1 && gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h);
+            const hit2 = gdDual && gdCube2 && !o._used2 && gdPlayerRectOverlap(gdCube2, sx, o.y, o.w, o.h);
             if (hit1 || hit2) {
                 if (gameMode === "Stereo Madness" || gameMode === "Pulse Factory" || gameMode === "Grok Showcase"
                     || gameMode === "GD Builder Test" || gameMode === "GD AI Demon" || gameMode === "Wave Skill Tester") {
@@ -7746,8 +7920,8 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             if (o.type !== "gravityPortal" || o.used) continue;
             const sx = o.x - gdScroll;
-            const hit1 = rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h);
-            const hit2 = gdDual && gdCube2 && rectsOverlap(gdCube2.x, gdCube2.y, gdCube2.w, gdCube2.h, sx, o.y, o.w, o.h);
+            const hit1 = gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h);
+            const hit2 = gdDual && gdCube2 && gdPlayerRectOverlap(gdCube2, sx, o.y, o.w, o.h);
             if (hit1 || hit2) {
                 const dir = o.gravityDir != null ? o.gravityDir : -1;
                 if (hit1 && !o._gUsed1) {
@@ -7795,7 +7969,7 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             const sx = o.x - gdScroll;
             if (o.type === "goal") {
-                if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                 continue;
             }
             if (o.type === "spike" || o.type === "spikeDown") {
@@ -7826,9 +8000,11 @@ function updateGeometryDash() {
     if (gdVehicle === "cube") {
         // Jump only on ground (supports upside-down via gdGravityDir)
         const gDir = gdGravityDir || 1;
-        if (gdHold() && gdCube.onGround) {
+        if (!gdCube.onGround) gdCube._jumpLatch = false;
+        if (gdHold() && gdCube.onGround && !gdCube._jumpLatch) {
             gdCube.vy = -10.5 * gDir;
             gdCube.onGround = false;
+            gdCube._jumpLatch = true;
             playJumpSound();
         }
         gdCube.vy += 0.52 * gDir;
@@ -7840,11 +8016,12 @@ function updateGeometryDash() {
         // ground / ceiling depending on gravity
         if (gDir > 0) {
             if (gdCube.y + gdCube.h >= gdGroundY) {
+                const body = gdPhysicsBody(gdCube);
                 let overGap = false;
                 for (let o of gdObstacles) {
                     if (o.type !== "gap") continue;
                     let sx = o.x - gdScroll;
-                    if (gdCube.x + gdCube.w > sx + 2 && gdCube.x < sx + o.w - 2) { overGap = true; break; }
+                    if (body.x + body.w > sx + 2 && body.x < sx + o.w - 2) { overGap = true; break; }
                 }
                 if (!overGap) {
                     gdCube.y = gdGroundY - gdCube.h;
@@ -7917,11 +8094,11 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             let sx = o.x - gdScroll;
             if (o.type === "goal") {
-                if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                 continue;
             }
             if (o.type === "secretCoin") {
-                if (!o._collected && rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) {
+                if (!o._collected && gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) {
                     o._collected = true;
                     o.type = "secretCoinGot";
                     kovanci += 50;
@@ -7936,7 +8113,7 @@ function updateGeometryDash() {
                 }
             } else if (o.type === "block" || o.type === "wall") {
                 // side collision only (not top landing which was already handled)
-                if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) {
+                if (gdPlayerBlockOverlap(gdCube, sx, o.y, o.w, o.h)) {
                     let landing = (gDir > 0)
                         ? (gdCube.vy >= 0 && gdCube.y + gdCube.h <= o.y + 16)
                         : (gdCube.vy <= 0 && gdCube.y >= o.y + o.h - 16);
@@ -7994,7 +8171,7 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             let sx = o.x - gdScroll;
             if (o.type === "goal") {
-                if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                 continue;
             }
             if (o.type === "spike" || o.type === "spikeDown") {
@@ -8012,7 +8189,7 @@ function updateGeometryDash() {
                     gdCube.onGround = true;
                     gdRobotJumping = false;
                     gdRobotJumpTime = 0;
-                } else if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) {
+                } else if (gdPlayerBlockOverlap(gdCube, sx, o.y, o.w, o.h)) {
                     // If Robot has just walked/fallen off the top, let gravity carry it
                     // down to the real ground instead of treating the block edge as lethal.
                     const fallingOffTop = gdCube.vy > 0 && gdCube.y < o.y + 16;
@@ -8200,7 +8377,7 @@ function updateGeometryDash() {
             for (let o of gdObstacles) {
                 const sx = o.x - gdScroll;
                 if (o.type === "goal") {
-                    if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                    if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                     continue;
                 }
                 if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
@@ -8242,7 +8419,7 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             let sx = o.x - gdScroll;
             if (o.type === "goal") {
-                if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                 continue;
             }
             if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
@@ -8260,13 +8437,17 @@ function updateGeometryDash() {
             }
         }
     } else if (gdVehicle === "ship") {
-        // Hold = thrust against gravity, release = fall with gravity
+        // Real GD-style ship: strong vertical climb on hold, slower glide on release
         const gDir = gdGravityDir || 1;
-        if (gdHold()) gdCube.vy -= 0.62 * gDir;
-        else gdCube.vy += 0.62 * gDir;
-        gdCube.vy = constrain(gdCube.vy, -7.8, 7.8);
+        const thrust = 0.95; // hold → steep climb
+        const grav = 0.34;   // release → slower fall than climb
+        if (gdHold()) gdCube.vy -= thrust * gDir;
+        else gdCube.vy += grav * gDir;
+        // Higher max climb speed than fall speed (more vertical when holding)
+        if (gDir > 0) gdCube.vy = constrain(gdCube.vy, -10.5, 5.6);
+        else gdCube.vy = constrain(gdCube.vy, -5.6, 10.5);
         gdCube.y += gdCube.vy;
-        gdCube.rot = gdCube.vy * 0.06 * (gdGravityDir || 1);
+        gdCube.rot = constrain(gdCube.vy * 0.055 * gDir, -1.15, 1.15);
         // ceiling / floor
         if (gdCube.y < gdCeilY) { gdCube.y = gdCeilY; gdCube.vy = 0; }
         if (gdCube.y + gdCube.h > gdGroundY) { gdCube.y = gdGroundY - gdCube.h; gdCube.vy = 0; }
@@ -8275,7 +8456,7 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             let sx = o.x - gdScroll;
             if (o.type === "goal") {
-                if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                 continue;
             }
             if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
@@ -8410,11 +8591,11 @@ function updateGeometryDash() {
             for (let o of gdObstacles) {
                 const sx = o.x - gdScroll;
                 if (o.type === "goal") {
-                    if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                    if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                     continue;
                 }
                 if (o.type === "secretCoin") {
-                    if (!o._collected && rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) {
+                    if (!o._collected && gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) {
                         o._collected = true; o.type = "secretCoinGot";
                         kovanci += 50; localStorage.setItem("snakeCoins", kovanci); playCoinSound();
                     }
@@ -8469,7 +8650,7 @@ function updateGeometryDash() {
             for (let o of gdObstacles) {
                 const sx = o.x - gdScroll;
                 if (o.type === "goal") {
-                    if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                    if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                     continue;
                 }
                 if (o.type === "sawblade" && gdSawbladeHit(gdCube, o, sx)) { gdDie(); break; }
@@ -8533,7 +8714,7 @@ function updateGeometryDash() {
         for (let o of gdObstacles) {
             if (o.type !== "block" && o.type !== "plat" && o.type !== "wall") continue;
             let sx = o.x - gdScroll;
-            if (!rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) continue;
+            if (!gdPlayerBlockOverlap(gdCube, sx, o.y, o.w, o.h)) continue;
             const feet = gdCube.y + gdCube.h;
             const head = gdCube.y;
             if (gDir > 0) {
@@ -8586,7 +8767,7 @@ if (!gameOver) gdApplyPadOrbs({ input: gdHold(), boostYellow: 9.0, boostBlue: 7.
             for (let o of gdObstacles) {
                 const sx = o.x - gdScroll;
                 if (o.type === "goal") {
-                    if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                    if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                     continue;
                 }
                 if (o.type === "spike" || o.type === "spikeDown" || o.type === "hazard") {
@@ -8684,7 +8865,7 @@ if (!gameOver) gdApplyPadOrbs({ input: gdHold(), boostYellow: 9.0, boostBlue: 7.
                 } else if (o.type === "slope") {
                     if (gdFlyingSlopeCollide(gdCube, o, sx)) { gdDie(); break; }
                 } else if (o.type === "goal") {
-                    if (rectsOverlap(gdCube.x, gdCube.y, gdCube.w, gdCube.h, sx, o.y, o.w, o.h)) gdFinish();
+                    if (gdPlayerRectOverlap(gdCube, sx, o.y, o.w, o.h)) gdFinish();
                 }
             }
         }
@@ -8714,12 +8895,14 @@ if (!gameOver) gdApplyPadOrbs({ input: gdHold(), boostYellow: 9.0, boostBlue: 7.
         const armed = gdCube2._arm;
 
         if (v2 === "ship") {
-            // continuous hold thrust (NOT ufo)
-            if (hold) gdCube2.vy -= 0.62 * g2;
-            else gdCube2.vy += 0.62 * g2;
-            gdCube2.vy = constrain(gdCube2.vy, -7.8, 7.8);
+            // Match primary GD-style ship (strong climb, soft fall)
+            const thrust = 0.95, grav = 0.34;
+            if (hold) gdCube2.vy -= thrust * g2;
+            else gdCube2.vy += grav * g2;
+            if (g2 > 0) gdCube2.vy = constrain(gdCube2.vy, -10.5, 5.6);
+            else gdCube2.vy = constrain(gdCube2.vy, -5.6, 10.5);
             gdCube2.y += gdCube2.vy;
-            gdCube2.rot = gdCube2.vy * 0.06 * g2;
+            gdCube2.rot = constrain(gdCube2.vy * 0.055 * g2, -1.15, 1.15);
             gdCube2.onGround = false;
             if (gdCube2.y < gdCeilY) { gdCube2.y = gdCeilY; gdCube2.vy = 0; }
             if (gdCube2.y + gdCube2.h > gdGroundY) { gdCube2.y = gdGroundY - gdCube2.h; gdCube2.vy = 0; }
@@ -8855,12 +9038,14 @@ if (!gameOver) gdApplyPadOrbs({ input: gdHold(), boostYellow: 9.0, boostBlue: 7.
             }
             gdCube2.rot = gdCube2.onGround ? 0 : constrain(gdCube2.vy * 0.035, -0.45, 0.45);
         } else {
-            // cube / mini
+            // cube / mini — one jump per landing; hold auto-jumps on next land (no per-frame spam)
+            if (!gdCube2.onGround) gdCube2._jumpLatch = false;
             if (armed && hold && gdCube2.onGround && !gdCube2._jumpLatch) {
-                gdCube2.vy = -10.5 * g2; gdCube2.onGround = false;
-                gdCube2._jumpLatch = true; playJumpSound();
+                gdCube2.vy = -10.5 * g2;
+                gdCube2.onGround = false;
+                gdCube2._jumpLatch = true;
+                playJumpSound();
             }
-            if (!hold) gdCube2._jumpLatch = false;
             gdCube2.vy += 0.52 * g2;
             if (g2 < 0) { if (gdCube2.vy < -13) gdCube2.vy = -13; }
             else { if (gdCube2.vy > 13) gdCube2.vy = 13; }
@@ -8875,7 +9060,8 @@ if (!gameOver) gdApplyPadOrbs({ input: gdHold(), boostYellow: 9.0, boostBlue: 7.
         }
 
         // Full collisions: blocks (land/hit), slopes, spikes, pads
-        for (let o of gdObstacles) {
+        if (!gameOver) for (let o of gdObstacles) {
+            if (gameOver || !gdCube2) break;
             const sx = o.x - gdScroll;
             if (o.type === "spike" || o.type === "spikeDown") {
                 if (gdSpikeHit(gdCube2, o, sx)) { deathCause = "Dual spike"; gdDie(); break; }
@@ -8889,7 +9075,7 @@ if (!gameOver) gdApplyPadOrbs({ input: gdHold(), boostYellow: 9.0, boostBlue: 7.
             } else if (o.type === "sawblade") {
                 if (gdSawbladeHit(gdCube2, o, sx)) { deathCause = "Dual saw"; gdDie(); break; }
             } else if (o.type === "block" || o.type === "wall") {
-                if (!rectsOverlap(gdCube2.x, gdCube2.y, gdCube2.w, gdCube2.h, sx, o.y, o.w, o.h)) continue;
+                if (!gdPlayerBlockOverlap(gdCube2, sx, o.y, o.w, o.h)) continue;
                 const fly = (v2 === "ship" || v2 === "ufo" || v2 === "dart" || v2 === "wave" || v2 === "swing");
                 if (fly) {
                     if (gdFlyingBlockCollide(gdCube2, o, sx)) { deathCause = "Dual front block"; gdDie(); break; }
@@ -8949,19 +9135,42 @@ if (!gameOver) gdApplyPadOrbs({ input: gdHold(), boostYellow: 9.0, boostBlue: 7.
                     o._pad2 = false;
                 }
             } else if (o.type === "goal") {
-                if (rectsOverlap(gdCube2.x, gdCube2.y, gdCube2.w, gdCube2.h, sx, o.y, o.w, o.h)) {
+                if (gdPlayerRectOverlap(gdCube2, sx, o.y, o.w, o.h)) {
                     gdFinish();
                     break;
                 }
             }
         }
-        gdCube2.y = constrain(gdCube2.y, gdCeilY, gdGroundY - gdCube2.h);
+        if (!gameOver && gdCube2) {
+            gdCube2.y = constrain(gdCube2.y, gdCeilY, gdGroundY - gdCube2.h);
+        }
     }
+
+    if (gameOver || gdWon) return;
 
     gdCollectCoinsAndGoals();
 
     // Capture the live GD state for death replay. Do this after physics/collision so the replay shows the actual run.
     if (!gameOver && !gdWon) recordGDReplayFrame();
+}
+
+// Ordinary hitbox: full player bounds. The centered 20x20 core is ONLY for blocks/slopes.
+function gdPhysicsBody(body) {
+    if (!body) return null;
+    return { x: body.x, y: body.y, w: body.w || 20, h: body.h || 20 };
+}
+function gdBlockPhysicsBody(body) {
+    if (!body) return null;
+    const fullW = body.w || 20, fullH = body.h || 20;
+    const w = Math.min(20, fullW), h = Math.min(20, fullH);
+    return { x: body.x + (fullW - w) / 2, y: body.y + (fullH - h) / 2, w, h };
+}
+function gdPlayerRectOverlap(body, x, y, w, h, inset = 0) {
+    return !!body && rectsOverlap(body.x + inset, body.y + inset, Math.max(0, body.w - inset * 2), Math.max(0, body.h - inset * 2), x, y, w, h);
+}
+function gdPlayerBlockOverlap(body, x, y, w, h, inset = 0) {
+    const b = gdBlockPhysicsBody(body);
+    return !!b && rectsOverlap(b.x + inset, b.y + inset, Math.max(0, b.w - inset * 2), Math.max(0, b.h - inset * 2), x, y, w, h);
 }
 
 function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
@@ -8992,18 +9201,29 @@ function recordGDReplayFrame() {
 
 function saveCurrentGDReplay() {
     if (gdReplayRecording.length < 5) return;
-    const entry = {
-        kind: "gd", frames: gdReplayRecording.slice(),
-        score: gdTotalScore(), mode: gameMode, time: Date.now()
-    };
-    savedReplays.unshift(entry);
-    if (savedReplays.length > SAVED_REPLAYS_MAX) savedReplays.pop();
-    try { localStorage.setItem("savedDeathReplays", JSON.stringify(savedReplays)); } catch (e) {
-        // If storage is full, keep the replay in memory.
-        try {
-            const compact = savedReplays.map(r => ({ kind:r.kind || "snake", score:r.score, mode:r.mode, time:r.time, frames:r.frames }));
-            localStorage.setItem("savedDeathReplays", JSON.stringify(compact));
-        } catch (_) {}
+    try {
+        // Keep only last ~240 frames to avoid freezing the main thread on stringify
+        const frames = gdReplayRecording.length > 240
+            ? gdReplayRecording.slice(gdReplayRecording.length - 240)
+            : gdReplayRecording.slice();
+        const entry = {
+            kind: "gd", frames: frames,
+            score: gdTotalScore(), mode: gameMode, time: Date.now()
+        };
+        savedReplays.unshift(entry);
+        if (savedReplays.length > SAVED_REPLAYS_MAX) savedReplays.pop();
+        try { localStorage.setItem("savedDeathReplays", JSON.stringify(savedReplays)); } catch (e) {
+            try {
+                // Drop oldest frames further if storage is full
+                const compact = savedReplays.slice(0, 3).map(r => ({
+                    kind: r.kind || "snake", score: r.score, mode: r.mode, time: r.time,
+                    frames: (r.frames || []).slice(-120)
+                }));
+                localStorage.setItem("savedDeathReplays", JSON.stringify(compact));
+            } catch (_) {}
+        }
+    } catch (e) {
+        console.warn("saveCurrentGDReplay failed", e);
     }
 }
 
@@ -9138,6 +9358,7 @@ function gdSpiderPathBlocked(y0, y1) {
 
 function gdSpikeHit(cube, o, sx) {
     if (!cube || !o) return false;
+    cube = gdPhysicsBody(cube);
     let x1, y1, x2, y2, x3, y3;
     if (o.type === "spike") {
         x1 = sx; y1 = o.y + o.h;
@@ -9164,6 +9385,7 @@ function gdSpikeHit(cube, o, sx) {
 // Circle (saw) vs player AABB — true round hitbox
 function gdSawbladeHit(cube, o, sx) {
     if (!cube || !o || o.type !== "sawblade") return false;
+    cube = gdPhysicsBody(cube);
     const ox = sx + o.w * 0.5, oy = o.y + o.h * 0.5;
     const r = Math.min(o.w, o.h) * 0.48;
     // closest point on player rect to circle center
@@ -9187,7 +9409,9 @@ function gdBlockSideLethal(cube, o, sx) {
 
 function gdFlyingBlockCollide(cube, o, sx) {
     if (!cube || !o) return false;
-    const cl = cube.x + 2, cr = cube.x + cube.w - 2, ct = cube.y + 2, cb = cube.y + cube.h - 2;
+    const core = gdBlockPhysicsBody(cube);
+    const offX = core.x - cube.x, offY = core.y - cube.y;
+    const cl = core.x, cr = core.x + core.w, ct = core.y, cb = core.y + core.h;
     const ol = sx, orr = sx + o.w, ot = o.y, ob = o.y + o.h;
     if (cr <= ol || cl >= orr || cb <= ot || ct >= ob) return false;
     const overlapL = cr - ol;
@@ -9196,26 +9420,33 @@ function gdFlyingBlockCollide(cube, o, sx) {
     const overlapB = ob - ct;
     const minH = Math.min(overlapL, overlapR);
     const minV = Math.min(overlapT, overlapB);
-    if (minV <= minH + 1) {
-        // vertical → support (land on top or push under)
+    // Surface proximity: if nearly on top or under the block, always slide (never kill on gap edges)
+    const surfaceSlack = 8;
+    const nearTop = overlapT <= surfaceSlack;
+    const nearBot = overlapB <= surfaceSlack;
+    // Prefer vertical resolution generously so wave/dart can skim under/over consecutive blocks
+    // without dying when briefly "seeing" a front face at a gap.
+    if (nearTop || nearBot || minV <= minH + 6) {
         const cubeCy = cube.y + cube.h * 0.5;
         const oCy = o.y + o.h * 0.5;
-        if (cubeCy <= oCy) {
-            cube.y = o.y - cube.h;
+        if (cubeCy <= oCy || nearTop) {
+            cube.y = o.y - offY - core.h;
             if (cube.vy > 0) cube.vy = 0;
         } else {
-            cube.y = o.y + o.h;
+            cube.y = o.y + o.h - offY;
             if (cube.vy < 0) cube.vy = 0;
         }
         return false;
     }
     // Platformer mode: blocks are solid walls, never lethal
     if (typeof gdPlatformerMode !== "undefined" && gdPlatformerMode) {
-        if (overlapL < overlapR) cube.x = ol - cube.w + 2;
-        else cube.x = orr - 2;
+        if (overlapL < overlapR) cube.x = ol - offX - core.w;
+        else cube.x = orr - offX;
         return false;
     }
-    // Classic: side / front → lethal
+    // Classic: only a clear head-on front hit is lethal (auto-scroll → left face)
+    // Require substantial horizontal penetration relative to player size
+    if (minH < 3) return false;
     return true;
 }
 // Solid slope triangle verts in screen space (respects o.rot around center)
@@ -9274,24 +9505,26 @@ function gdFlyingSlopeCollide(cube, o, sx) {
     const xs = verts.map(v => v[0]), ys = verts.map(v => v[1]);
     const minX = Math.min(...xs), maxX = Math.max(...xs);
     const minY = Math.min(...ys), maxY = Math.max(...ys);
-    const cl = cube.x + 2, cr = cube.x + cube.w - 2, ct = cube.y + 2, cb = cube.y + cube.h - 2;
+    const core = gdBlockPhysicsBody(cube);
+    const offX = core.x - cube.x, offY = core.y - cube.y;
+    const cl = core.x, cr = core.x + core.w, ct = core.y, cb = core.y + core.h;
     if (cr <= minX || cl >= maxX || cb <= minY || ct >= maxY) return false;
-    const cx = cube.x + cube.w * 0.5;
+    const cx = core.x + core.w * 0.5;
     const surfaceY = gdSlopeSurfaceY(o, sx, cx);
     // Support from above the ramp (generous so ship/ufo/wave don't die on contact)
     if (cb >= surfaceY - 12 && cb <= surfaceY + 28) {
-        cube.y = surfaceY - cube.h;
+        cube.y = surfaceY - offY - core.h;
         if (cube.vy > 0) cube.vy = 0;
         return false;
     }
     // Support from below
     if (ct <= surfaceY + 12 && ct >= surfaceY - 28) {
-        cube.y = surfaceY;
+        cube.y = surfaceY - offY;
         if (cube.vy < 0) cube.vy = 0;
         return false;
     }
     // Deep inside solid wedge → death only if clearly below the surface
-    const midY = cube.y + cube.h * 0.5;
+    const midY = core.y + core.h * 0.5;
     if (midY > surfaceY + 14 &&
         gdPointInTri(cx, midY, verts[0][0], verts[0][1], verts[1][0], verts[1][1], verts[2][0], verts[2][1])) {
         return true;
@@ -9580,9 +9813,11 @@ function gdDie() {
         if (gdAIPilot && aiLabProfile === 3) gdAITrainingCooldown = 30;
     }
     if (!deathCause) deathCause = "Spike / obstacle";
+    // Keep hitbox trail after death so the player can review the path (cleared only on new attempt).
     gameOver = true;
     saveCurrentGDReplay();
-    playDeathSound();
+    if (/fall|gap|fell/i.test(String(deathCause || ""))) playFallSound();
+    else playDeathSound();
     screenShake = 12;
     if (gdCube) spawnParticles(gdCube.x + gdCube.w / 2, gdCube.y + gdCube.h / 2, 18, color(255, 40, 40));
     let sc = gdTotalScore();
@@ -9633,48 +9868,8 @@ function gdFinish() {
     playCoinSound();
 }
 
-function drawGeometryDash() {
-    // Keep the player's selected animated background in all GD modes.
-    izrisiOzadje();
-
-    // Light vehicle-specific tint on top, without hiding the selected background.
-    noStroke();
-    if (gdVehicle === "ship") fill(20, 50, 100, 38);
-    else if (gdVehicle === "wave") fill(90, 10, 120, 34);
-    else if (gdVehicle === "robot") fill(20, 120, 90, 30);
-    else if (gdVehicle === "ufo") fill(40, 80, 40, 32);
-    else if (gdVehicle === "ball") fill(120, 50, 30, 32);
-    else if (gdVehicle === "spider") fill(80, 20, 100, 34);
-    else if (gdVehicle === "dart") fill(100, 20, 40, 34);
-    else if (gdVehicle === "mini") fill(10, 80, 70, 30);
-    else fill(30, 20, 100, 28);
-    rect(0, 0, sirina, sirina);
-    if (gdAIMutatorActive("Darkness")) {
-        fill(0, 0, 12, 78); noStroke(); rect(0, 0, sirina, sirina);
-    }
-
-    stroke(90, 70, 150, 55); strokeWeight(1);
-    let off = (gdScroll * 0.25) % 40;
-    for (let x = -off; x < sirina; x += 40) line(x, 0, x, sirina);
-
-    // Always render the playable ceiling in every Geometry Dash mode.
-    // This keeps the boundary visible with Cube/Robot and under Darkness too,
-    // and makes Level Maker ROW changes visibly alter the usable playfield.
-    {
-        noStroke();
-        fill(18, 18, 34, 238);
-        rect(0, 0, sirina, Math.max(0, gdCeilY));
-        // Bright double edge makes the actual ceiling position easy to read.
-        fill(145, 105, 245, 235);
-        rect(0, Math.max(0, gdCeilY - 4), sirina, 4);
-        fill(220, 195, 255, 220);
-        rect(0, Math.max(0, gdCeilY - 1), sirina, 1);
-    }
-
-    // ground
-    noStroke(); fill(25, 25, 40); rect(0, gdGroundY, sirina, sirina - gdGroundY);
-    fill(120, 90, 220); rect(0, gdGroundY, sirina, 4);
-
+function _lbDrawObstaclesLikeGame() {
+    if (!gdObstacles || !gdObstacles.length) return;
     for (let o of gdObstacles) {
         if (o.type === "decoPixel") continue; // drawn in final pass (always on top)
         if (o.type === "decoStroke") {
@@ -9936,6 +10131,52 @@ function drawGeometryDash() {
     }
 
 
+}
+
+function drawGeometryDash() {
+    // Keep the player's selected animated background in all GD modes.
+    izrisiOzadje();
+
+    // Light vehicle-specific tint on top, without hiding the selected background.
+    noStroke();
+    if (gdVehicle === "ship") fill(20, 50, 100, 38);
+    else if (gdVehicle === "wave") fill(90, 10, 120, 34);
+    else if (gdVehicle === "robot") fill(20, 120, 90, 30);
+    else if (gdVehicle === "ufo") fill(40, 80, 40, 32);
+    else if (gdVehicle === "ball") fill(120, 50, 30, 32);
+    else if (gdVehicle === "spider") fill(80, 20, 100, 34);
+    else if (gdVehicle === "dart") fill(100, 20, 40, 34);
+    else if (gdVehicle === "mini") fill(10, 80, 70, 30);
+    else fill(30, 20, 100, 28);
+    rect(0, 0, sirina, sirina);
+    if (gdAIMutatorActive("Darkness")) {
+        fill(0, 0, 12, 78); noStroke(); rect(0, 0, sirina, sirina);
+    }
+
+    stroke(90, 70, 150, 55); strokeWeight(1);
+    let off = (gdScroll * 0.25) % 40;
+    for (let x = -off; x < sirina; x += 40) line(x, 0, x, sirina);
+
+    // Always render the playable ceiling in every Geometry Dash mode.
+    // This keeps the boundary visible with Cube/Robot and under Darkness too,
+    // and makes Level Maker ROW changes visibly alter the usable playfield.
+    {
+        noStroke();
+        fill(18, 18, 34, 238);
+        rect(0, 0, sirina, Math.max(0, gdCeilY));
+        // Bright double edge makes the actual ceiling position easy to read.
+        fill(145, 105, 245, 235);
+        rect(0, Math.max(0, gdCeilY - 4), sirina, 4);
+        fill(220, 195, 255, 220);
+        rect(0, Math.max(0, gdCeilY - 1), sirina, 1);
+    }
+
+    // ground
+    noStroke(); fill(25, 25, 40); rect(0, gdGroundY, sirina, sirina - gdGroundY);
+    fill(120, 90, 220); rect(0, gdGroundY, sirina, 4);
+
+    _lbDrawObstaclesLikeGame();
+
     if (gameMode === "GD Portal Level") {
         fill(255); textAlign(CENTER, TOP); textSize(14);
         text("PORTAL LEVEL  •  " + gdVehicle.toUpperCase() + "  •  " + (gdPortalStage+1) + "/" + gdPortalVehicles.length + "  •  TOTAL " + gdTotalScore() + " m", sirina/2, 12);
@@ -10181,11 +10422,52 @@ function drawGeometryDash() {
         }
     }
     
+    // Optional hitbox trail. K toggles recording+display; kept after death until next attempt.
+    if (levelBuilder && (levelBuilder.showHitboxTrail || levelBuilder.showHitboxes)) {
+        const trail = levelBuilder.hitboxTrail || (levelBuilder.hitboxTrail = []);
+        if (levelBuilder.showHitboxTrail) {
+            // Record only while alive
+            if (gdCube && !gameOver && !gdWon) {
+                const full = gdPhysicsBody(gdCube), core = gdBlockPhysicsBody(gdCube);
+                trail.push({
+                    full: { x: full.x + gdScroll, y: full.y, w: full.w, h: full.h },
+                    core: { x: core.x + gdScroll, y: core.y, w: core.w, h: core.h },
+                    dual: gdDual && gdCube2 ? (() => { const b = gdPhysicsBody(gdCube2); return { x: b.x + gdScroll, y: b.y, w: b.w, h: b.h }; })() : null
+                });
+                // Cap length so long dual runs don't freeze the draw loop
+                if (trail.length > 900) trail.splice(0, trail.length - 900);
+            }
+            noFill();
+            for (let i = 0; i < trail.length; i++) {
+                const t = trail[i];
+                if (!t || !t.full) continue;
+                stroke(0, 220, 255, 190); strokeWeight(1.5);
+                rect(t.full.x - gdScroll, t.full.y, t.full.w, t.full.h);
+                if (t.core) {
+                    stroke(255, 40, 220, 230); strokeWeight(2);
+                    rect(t.core.x - gdScroll, t.core.y, t.core.w, t.core.h);
+                }
+                if (t.dual) { stroke(255, 180, 40, 220); strokeWeight(1.5); rect(t.dual.x - gdScroll, t.dual.y, t.dual.w, t.dual.h); }
+            }
+        }
+        // do NOT clear trail when only showHitboxes is on — trail is independent
+    }
+
     // Debug hitboxes — shapes match real collision (tri / circle / box)
     if (levelBuilder && levelBuilder.showHitboxes && gdCube) {
         noFill();
-        stroke(0, 255, 80, 200); strokeWeight(1.5);
+        stroke(255, 255, 255, 255); strokeWeight(2);
+        const body = gdPhysicsBody(gdCube);
+        const hbW = body.w, hbH = body.h;
+        const hbX = body.x;
+        const hbY = body.y;
+        rect(hbX, hbY, hbW, hbH);
+        // Bright, high-contrast outlines: cyan = full player bounds; neon green = block/slope core.
+        stroke(0, 230, 255, 255); strokeWeight(3);
         rect(gdCube.x, gdCube.y, gdCube.w, gdCube.h);
+        const coreBox = gdBlockPhysicsBody(gdCube);
+        stroke(255, 40, 220, 255); strokeWeight(4);
+        rect(coreBox.x, coreBox.y, coreBox.w, coreBox.h);
         if (gdDual && gdCube2) {
             stroke(255, 180, 40, 220);
             rect(gdCube2.x, gdCube2.y, gdCube2.w, gdCube2.h);
@@ -10289,6 +10571,7 @@ let vLabel = gdVehicle === "cube" ? "CUBE" : gdVehicle === "ship" ? "SHIP" : gdV
         fill(255); textSize(16); text("SPACE = retry  •  ESC = menu", sirina / 2, sirina / 2 + 40);
     }
 }
+
 
 // ===== TOWER CLIMB =====
 // Deterministic, bounded patterns: every next platform is reachable by the same jump physics.
@@ -11503,6 +11786,8 @@ function updateMultiplayerStep() {
 }
 
 function resetGame() {
+    // Also clear stale traces when restarting or switching to any ordinary mode.
+    if (levelBuilder) levelBuilder.hitboxTrail = [];
     isDailyChallenge = (gameMode === "Daily Challenge");
     isCustomMode = (gameMode === "Custom Mode");
     ghostRaceEnabled = (gameMode === "Ghost Race");
@@ -11715,6 +12000,7 @@ function activateMainMenuOption() {
         // Level Builder (pixel editor still available via button inside)
         if (!levelBuilder.grid || !levelBuilder.grid.length) builderGridInit();
         vPodmenijuLevelBuilder = true;
+        levelBuilder.inEditor = false;
         levelBuilder.msg = "";
     } else if (glavniMeniIzbira === 4) {
         menu = false;
@@ -12978,7 +13264,7 @@ function mouseWheel(event) {
             if (event.delta > 0) levelBuilder.toolScroll = min(maxTS, (levelBuilder.toolScroll || 0) + 1);
             else levelBuilder.toolScroll = max(0, (levelBuilder.toolScroll || 0) - 1);
         } else {
-            const maxScroll = max(0, levelBuilder.cols - LB_EDITOR_VISIBLE_COLS);
+            const maxScroll = max(0, levelBuilder.cols - lbVisibleCols());
             if (event.delta > 0) levelBuilder.scrollC = min(maxScroll, (levelBuilder.scrollC || 0) + 3);
             else levelBuilder.scrollC = max(0, (levelBuilder.scrollC || 0) - 3);
         }
@@ -13135,6 +13421,32 @@ function mousePressed() {
             return;
         }
         if (vPodmenijuLevelBuilder) {
+            // --- Level list browser (before editor) ---
+            if (!levelBuilder.inEditor) {
+                const nb = levelBuilder._browserNew;
+                if (nb && mouseX >= nb.x && mouseX < nb.x + nb.w && mouseY >= nb.y && mouseY < nb.y + nb.h) {
+                    builderOpenNewLevel(); return;
+                }
+                if (levelBuilder._browserRows) {
+                    for (const row of levelBuilder._browserRows) {
+                        if (mouseX >= row.x && mouseX < row.x + row.w && mouseY >= row.y && mouseY < row.y + row.h) {
+                            levelBuilder.browserSel = row.idx;
+                            builderOpenLevel(row.idx);
+                            return;
+                        }
+                    }
+                }
+                const bp = levelBuilder._browserPrev, bnxt = levelBuilder._browserNext;
+                if (bp && mouseX >= bp.x && mouseX < bp.x + bp.w && mouseY >= bp.y && mouseY < bp.y + bp.h) {
+                    levelBuilder.savedPage = Math.max(0, (levelBuilder.savedPage || 0) - 1); playMenuSound(); return;
+                }
+                if (bnxt && mouseX >= bnxt.x && mouseX < bnxt.x + bnxt.w && mouseY >= bnxt.y && mouseY < bnxt.y + bnxt.h) {
+                    const maxVis = 11;
+                    const pages = Math.max(1, Math.ceil((levelBuilder.saved || []).length / maxVis));
+                    levelBuilder.savedPage = Math.min(pages - 1, (levelBuilder.savedPage || 0) + 1); playMenuSound(); return;
+                }
+                return;
+            }
             // --- Deco pixel editor ---
             if (levelBuilder.decoEditor) {
                 const hit = (b) => b && mouseX >= b.x && mouseX < b.x + b.w && mouseY >= b.y && mouseY < b.y + b.h;
@@ -13256,8 +13568,8 @@ function mousePressed() {
                 }
                 if (mouseX >= 270 && mouseX < 312) {
                     builderPushUndo();
-                    levelBuilder.cols = max(LB_EDITOR_VISIBLE_COLS, levelBuilder.cols - 4);
-                    levelBuilder.scrollC = min(levelBuilder.scrollC || 0, max(0, levelBuilder.cols - LB_EDITOR_VISIBLE_COLS));
+                    levelBuilder.cols = max(lbVisibleCols(), levelBuilder.cols - 4);
+                    levelBuilder.scrollC = min(levelBuilder.scrollC || 0, max(0, levelBuilder.cols - lbVisibleCols()));
                     levelBuilder.msg = "Cols: " + levelBuilder.cols; return;
                 }
                 if (mouseX >= 316 && mouseX < 358) {
@@ -13275,13 +13587,7 @@ function mousePressed() {
                     levelBuilder.rows = max(8, levelBuilder.rows - 1);
                     levelBuilder.msg = "Rows: " + levelBuilder.rows; return;
                 }
-                if (mouseX >= 496 && mouseX < 544) {
-                    levelBuilder.name = "My Level " + (levelBuilder.saved.length + 1);
-                    builderGridInit();
-                    levelBuilder.msg = "New blank level — place objects, then SAVE";
-                    playMenuSound();
-                    return;
-                }
+                // NEW level is created from the browser screen
                 if (mouseX >= 548 && mouseX < 594) {
                     levelBuilder.showHitboxes = !levelBuilder.showHitboxes;
                     levelBuilder.msg = levelBuilder.showHitboxes ? "Hitboxes ON" : "Hitboxes OFF";
@@ -13292,9 +13598,9 @@ function mousePressed() {
             const L = builderLayout();
             const gx = L.gx, gy = L.gy, cw = L.cw, ch = L.ch;
             const tools = builderCurrentTools();
-            const vis = LB_EDITOR_VISIBLE_COLS;
+            const vis = (typeof builderLayout === "function" && builderLayout().visCols) || LB_EDITOR_VISIBLE_COLS;
             const scrollC = levelBuilder.scrollC || 0;
-            if (mouseY >= gy && mouseY < gy + levelBuilder.rows * ch && mouseX >= gx && mouseX < gx + vis * cw) {
+            if (mouseY >= (L.topUI || 68) && mouseY < sirina - (L.bottomUI || 128) && mouseX >= 0 && mouseX < sirina) {
                 if (levelBuilder.selectMode) {
                     const k = builderPickKeyAt(mouseX, mouseY);
                     if (k) {
@@ -13327,7 +13633,7 @@ function mousePressed() {
             const sb = levelBuilder._scrollBar;
             if (sb && mouseY >= sb.y && mouseY <= sb.y + sb.h && mouseX >= sb.x && mouseX <= sb.x + sb.w) {
                 levelBuilder.draggingScroll = true;
-                const maxScroll = max(0, levelBuilder.cols - LB_EDITOR_VISIBLE_COLS);
+                const maxScroll = max(0, levelBuilder.cols - lbVisibleCols());
                 const rel = constrain((mouseX - sb.x) / sb.w, 0, 1);
                 levelBuilder.scrollC = floor(rel * maxScroll);
                 return;
@@ -13351,6 +13657,16 @@ function mousePressed() {
                     return;
                 }
             }
+            if (levelBuilder._pinDecoErase) {
+                const b = levelBuilder._pinDecoErase;
+                if (mouseX >= b.x && mouseX < b.x + b.w && mouseY >= b.y && mouseY < b.y + b.h) {
+                    levelBuilder.tool = b.idx;
+                    levelBuilder.selectMode = false;
+                    levelBuilder.decoEditor = false;
+                    levelBuilder.msg = "DECO ERASE — removes decoration only";
+                    return;
+                }
+            }
             const toolsY = L.toolsY0;
             const perRow = L.perRow;
             const toolRowsVisible = L.toolRowsVisible || 3;
@@ -13360,55 +13676,58 @@ function mousePressed() {
                 if (mouseY >= toolsY && mouseY < toolsY + 16) {
                     levelBuilder.toolScroll = max(0, tScroll - 1); return;
                 }
-                if (mouseY >= toolsY + 36 && mouseY < toolsY + 52) {
+                if (mouseY >= toolsY + (L.toolRowH || 17) && mouseY < toolsY + (L.toolsH || 34)) {
                     const maxTS = max(0, Math.ceil(tools.length / perRow) - toolRowsVisible);
                     levelBuilder.toolScroll = min(maxTS, tScroll + 1); return;
                 }
             }
-            if (mouseY >= toolsY && mouseY < toolsY + toolRowsVisible * 18) {
+            const rowH = L.toolRowH || 17;
+            if (mouseY >= toolsY && mouseY < toolsY + toolRowsVisible * rowH) {
                 for (let row = 0; row < toolRowsVisible; row++) {
                     for (let col = 0; col < perRow; col++) {
                         const i = (row + tScroll) * perRow + col;
                         if (i >= tools.length) continue;
                         const bx = 6 + col * 54;
-                        const by = toolsY + row * 18;
-                        if (mouseX >= bx && mouseX < bx + 52 && mouseY >= by && mouseY < by + 16) {
+                        const by = toolsY + row * rowH;
+                        if (mouseX >= bx && mouseX < bx + 52 && mouseY >= by && mouseY < by + rowH) {
                             levelBuilder.tool = i; return;
                         }
                     }
                 }
             }
             const btnY = L.btnY;
-            if (mouseY >= btnY && mouseY <= btnY + 20) {
-                if (mouseX >= 4 && mouseX < 52) { startBuilderTest(); return; }
-                if (mouseX >= 54 && mouseX < 98) { builderSaveLevel(true); return; }
-                if (mouseX >= 100 && mouseX < 144) { builderSaveLevel(false); return; }
-                if (mouseX >= 146 && mouseX < 186) { builderDeleteLevel(); return; }
-                if (mouseX >= 188 && mouseX < 228) { builderPushUndo(); for (let rr=0; rr<levelBuilder.rows; rr++) for (let cc=0; cc<levelBuilder.cols; cc++) levelBuilder.grid[rr][cc]=0; levelBuilder.cellMeta={}; levelBuilder.decoCells={}; levelBuilder.decoStrokes=[]; levelBuilder.decoPlacements={}; levelBuilder.selectedCell=null; levelBuilder.selectedCells=[]; levelBuilder.msg = "Cleared"; return; }
-                if (mouseX >= 230 && mouseX < 270) { levelBuilder.selectMode = !levelBuilder.selectMode; if (!levelBuilder.selectMode) { levelBuilder.selectedCells = []; } levelBuilder.msg = levelBuilder.selectMode ? "SELECT: click / drag / Shift+click — no paint" : "Paint mode"; return; }
-                if (mouseX >= 272 && mouseX < 308) { builderResizeSelected(-0.25); return; }
-                if (mouseX >= 310 && mouseX < 346) { builderResizeSelected(0.25); return; }
-                if (mouseX >= 352 && mouseX < 380) { builderNudgeSelected(-0.2, 0); return; }
-                if (mouseX >= 382 && mouseX < 410) { builderNudgeSelected(0.2, 0); return; }
-                if (mouseX >= 412 && mouseX < 440) { builderNudgeSelected(0, 0.2); return; }
-                if (mouseX >= 442 && mouseX < 470) { builderNudgeSelected(0, -0.2); return; }
-                if (mouseX >= 472 && mouseX < 508) { builderRotateSelected(); return; }
-            }
-
-            const sY = btnY + 24;
-            if (mouseY >= sY && mouseY <= sY + 16) {
-                const pages = Math.max(1, Math.ceil(levelBuilder.saved.length / 10));
-                if (mouseX >= 520 && mouseX < 542) { levelBuilder.savedPage = Math.max(0, (levelBuilder.savedPage || 0) - 1); return; }
-                if (mouseX >= 544 && mouseX < 566) { levelBuilder.savedPage = Math.min(pages - 1, (levelBuilder.savedPage || 0) + 1); return; }
-            }
-            if (mouseY >= sY + 16 && mouseY <= sY + 36) {
-                let sx = 8;
-                const start = (levelBuilder.savedPage || 0) * 10;
-                for (let i = start; i < Math.min(levelBuilder.saved.length, start + 10); i++) {
-                    if (mouseX >= sx && mouseX < sx + 48) { builderLoadLevel(i); return; }
-                    sx += 49;
+            const bh = (L.btnH || 22);
+            if (mouseY >= btnY && mouseY <= btnY + bh && levelBuilder._actionBtns) {
+                for (const b of levelBuilder._actionBtns) {
+                    if (mouseX >= b.x && mouseX < b.x + b.w) {
+                        const lab = b.label;
+                        if (lab === "PLAY") { startBuilderTest(); return; }
+                        if (lab === "BACK") { builderBackToList(); return; }
+                        if (lab === "CLR") {
+                            builderPushUndo();
+                            for (let rr=0; rr<levelBuilder.rows; rr++) for (let cc=0; cc<levelBuilder.cols; cc++) levelBuilder.grid[rr][cc]=0;
+                            levelBuilder.cellMeta={}; levelBuilder.decoCells={}; levelBuilder.decoStrokes=[];
+                            levelBuilder.decoPlacements={}; levelBuilder.selectedCell=null; levelBuilder.selectedCells=[];
+                            levelBuilder.msg = "Cleared"; return;
+                        }
+                        if (lab === "SEL" || lab === "SEL*") {
+                            levelBuilder.selectMode = !levelBuilder.selectMode;
+                            if (!levelBuilder.selectMode) levelBuilder.selectedCells = [];
+                            levelBuilder.msg = levelBuilder.selectMode ? "SELECT mode" : "Paint mode"; return;
+                        }
+                        if (lab === "S−") { builderResizeSelected(-0.25); return; }
+                        if (lab === "S+") { builderResizeSelected(0.25); return; }
+                        if (lab === "←") { builderNudgeSelected(-0.2, 0); return; }
+                        if (lab === "→") { builderNudgeSelected(0.2, 0); return; }
+                        if (lab === "↑") { builderNudgeSelected(0, 0.2); return; }
+                        if (lab === "↓") { builderNudgeSelected(0, -0.2); return; }
+                        if (lab === "ROT") { builderRotateSelected(); return; }
+                        return;
+                    }
                 }
             }
+
+            // saved levels handled on browser screen
             return;
         }
         if (vPodmenijuBuilder) {
@@ -13544,7 +13863,7 @@ function mouseDragged() {
         if (levelBuilder.draggingScroll) {
             const sb = levelBuilder._scrollBar;
             if (sb) {
-                const maxScroll = max(0, levelBuilder.cols - LB_EDITOR_VISIBLE_COLS);
+                const maxScroll = max(0, levelBuilder.cols - lbVisibleCols());
                 const rel = constrain((mouseX - sb.x) / max(1, sb.w), 0, 1);
                 levelBuilder.scrollC = floor(rel * maxScroll);
             }
@@ -13555,7 +13874,7 @@ function mouseDragged() {
             const L = typeof builderLayout === "function" ? builderLayout() : null;
             if (L) {
                 const gx = L.gx, gy = L.gy, cw = L.cw, ch = L.ch;
-                const vis = LB_EDITOR_VISIBLE_COLS;
+                const vis = (typeof builderLayout === "function" && builderLayout().visCols) || LB_EDITOR_VISIBLE_COLS;
                 {
                     const k = builderPickKeyAt(mouseX, mouseY);
                     if (k) {
@@ -14475,6 +14794,38 @@ function keyPressed() {
             return;
         }
         if (vPodmenijuLevelBuilder) {
+            if (!levelBuilder.inEditor) {
+                if (keyCode === ESCAPE || keyCode === BACKSPACE) {
+                    vPodmenijuLevelBuilder = false; playMenuSound(); return;
+                }
+                const list = levelBuilder.saved || [];
+                const maxVis = 11;
+                if (keyCode === UP_ARROW) {
+                    levelBuilder.browserSel = Math.max(0, (levelBuilder.browserSel || 0) - 1);
+                    levelBuilder.savedPage = Math.floor(levelBuilder.browserSel / maxVis);
+                    playMenuSound(); return;
+                }
+                if (keyCode === DOWN_ARROW) {
+                    if (list.length) {
+                        levelBuilder.browserSel = Math.min(list.length - 1, (levelBuilder.browserSel || 0) + 1);
+                        levelBuilder.savedPage = Math.floor(levelBuilder.browserSel / maxVis);
+                    }
+                    playMenuSound(); return;
+                }
+                if (keyCode === ENTER || keyCode === 32) {
+                    if (list.length && levelBuilder.browserSel >= 0) builderOpenLevel(levelBuilder.browserSel);
+                    else builderOpenNewLevel();
+                    return;
+                }
+                if (key === 'n' || key === 'N') { builderOpenNewLevel(); return; }
+                if ((keyCode === DELETE || keyCode === 46) && list.length) {
+                    levelBuilder.saveIdx = levelBuilder.browserSel || 0;
+                    builderDeleteLevel();
+                    levelBuilder.browserSel = Math.min(levelBuilder.browserSel, Math.max(0, list.length - 1));
+                    return;
+                }
+                return;
+            }
             if ((keyIsDown(CONTROL) || keyIsDown(17)) && (key === 'z' || key === 'Z')) { builderUndo(); return false; }
             if ((keyIsDown(CONTROL) || keyIsDown(17)) && (key === 'y' || key === 'Y')) { builderRedo(); return false; }
             if ((keyIsDown(CONTROL) || keyIsDown(17)) && (key === 'c' || key === 'C')) { builderCopySelection(); return false; }
@@ -14489,11 +14840,11 @@ function keyPressed() {
                 return false;
             }
             if (keyCode === RIGHT_ARROW) {
-                const vis = (typeof LB_EDITOR_VISIBLE_COLS !== "undefined") ? LB_EDITOR_VISIBLE_COLS : 16;
+                const vis = lbVisibleCols();
                 levelBuilder.scrollC = min(max(0, levelBuilder.cols - vis), (levelBuilder.scrollC || 0) + 1);
                 return false;
             }
-            if (keyCode === ESCAPE || keyCode === BACKSPACE) { vPodmenijuLevelBuilder = false; playMenuSound(); return; }
+            if (keyCode === ESCAPE || keyCode === BACKSPACE) { builderBackToList(); return; }
             const tools = builderCurrentTools();
             if (keyCode >= 49 && keyCode <= 48 + min(tools.length, 9)) { levelBuilder.tool = keyCode - 49; playMenuSound(); return; }
             if (key === '0' && tools.length >= 10) { levelBuilder.tool = 9; playMenuSound(); return; }
@@ -14506,7 +14857,7 @@ function keyPressed() {
                 playMenuSound(); return;
             }
             if (keyCode === RIGHT_ARROW) {
-                levelBuilder.scrollC = min(max(0, levelBuilder.cols - LB_EDITOR_VISIBLE_COLS), (levelBuilder.scrollC || 0) + 4);
+                levelBuilder.scrollC = min(max(0, levelBuilder.cols - lbVisibleCols()), (levelBuilder.scrollC || 0) + 4);
                 playMenuSound(); return;
             }
             if (keyCode === ENTER || keyCode === 32) { startBuilderTest(); return; }
@@ -14516,12 +14867,19 @@ function keyPressed() {
                 playMenuSound();
                 return;
             }
+            if (key === 'k' || key === 'K') {
+                levelBuilder.showHitboxTrail = !levelBuilder.showHitboxTrail;
+                if (!levelBuilder.showHitboxTrail) levelBuilder.hitboxTrail = [];
+                levelBuilder.msg = levelBuilder.showHitboxTrail ? "Hitbox trail ON (K to hide)" : "Hitbox trail OFF";
+                playMenuSound();
+                return;
+            }
             if (key === 'n' || key === 'N') {
                 const n = prompt("Level name:", levelBuilder.name || "My Level");
                 if (n) levelBuilder.name = n.slice(0, 24);
                 return;
             }
-            if (key === 's' || key === 'S') { builderSaveLevel(true); return; }
+            if (key === 's' || key === 'S') { builderAutoSave(); levelBuilder.msg = "Shranjeno"; playMenuSound(); return; }
             if (key === 'p' || key === 'P') {
                 levelBuilder.portalTargetIdx = (levelBuilder.portalTargetIdx + 1) % LB_PORTAL_TARGETS.length;
                 levelBuilder.portalTarget = LB_PORTAL_TARGETS[levelBuilder.portalTargetIdx];
@@ -14697,6 +15055,7 @@ function keyPressed() {
             if (plrFromBuilder || levelBuilder.testing) {
                 menu = true;
                 vPodmenijuLevelBuilder = true;
+                levelBuilder.inEditor = true;
                 levelBuilder.testing = false;
                 plrFromBuilder = false;
                 gameOver = false;
@@ -14727,6 +15086,7 @@ function keyPressed() {
                 vPodmenijuAILab = true;
             } else if (fromBuilder) {
                 vPodmenijuLevelBuilder = true;
+                levelBuilder.inEditor = true;
             }
             stopAmbient();
             return;
